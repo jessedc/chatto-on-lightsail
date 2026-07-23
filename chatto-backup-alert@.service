@@ -1,0 +1,30 @@
+[Unit]
+Description=Publish an alert for failed unit %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=chatto
+Group=chatto
+WorkingDirectory=/var/lib/chatto
+EnvironmentFile=/etc/chatto/backup.env
+Environment=AWS_CONFIG_FILE=/etc/chatto/aws/config
+Environment=AWS_SHARED_CREDENTIALS_FILE=/etc/chatto/aws/credentials
+Environment=AWS_PROFILE=chatto-backup
+Environment=AWS_PAGER=
+ExecStart=/usr/local/sbin/chatto-lightsail-alert.sh %i
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

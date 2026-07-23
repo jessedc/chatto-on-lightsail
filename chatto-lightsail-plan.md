@@ -2,14 +2,26 @@
 
 ## Summary and Feasibility
 
-This is feasible for the selected workload: a private community with at most 10 active users, core chat, images/files, no video transcoding, no voice/video calls, and operator-managed accounts.
+This deployment is **conditionally supported** for the selected workload: a
+private community with at most 10 active users, core chat, images/files, no
+video transcoding, no voice/video calls, and operator-managed accounts. The
+$5/512 MB instance is the initial target, not an unconditional production
+recommendation. It must pass the capacity gate in the acceptance section; use
+the $7/1 GB bundle before production if any threshold fails.
 
 - Target the $5 public-IPv4 Lightsail bundle: 2 vCPUs, 512 MB RAM, 20 GB SSD, and 1 TB transfer. The $5 compute price excludes S3 backup charges and any domain-registration cost. [Lightsail bundle specifications](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-bundles.html)
 - Debian 13 is an available Lightsail blueprint. [Supported Lightsail blueprints](https://docs.aws.amazon.com/lightsail/latest/userguide/compare-options-choose-lightsail-instance-image.html)
 - Chatto supports a single-process deployment containing the web app and embedded NATS/JetStream, with no external database or proxy. [Standalone deployment](https://docs.chatto.run/guides/deployment/binary/)
 - Releases are statically built for Linux amd64 and arm64 (`CGO_ENABLED=0`), so Debian 13 compatibility is straightforward. [Release configuration](https://github.com/chattocorp/chatto/blob/main/.goreleaser.yml)
 - There is no published 512 MB minimum. The source's larger Kubernetes example requests 128 MiB for Chatto and 256 MiB for separate NATS, while allowing substantially higher limits. The standalone process combines both, so 512 MB is viable but tight and requires swap, conservative features, and monitoring. [Chatto resources](https://github.com/chattocorp/chatto/blob/main/examples/k8s/chatto.yaml), [NATS resources](https://github.com/chattocorp/chatto/blob/main/examples/k8s/nats.yaml)
-- Do not deploy Docker Compose, LiveKit, ffmpeg, or the search provider on this plan. Upgrade to at least the $7/1 GB public-IPv4 bundle if the acceptance thresholds below are not met.
+- Do not deploy Docker Compose, LiveKit, ffmpeg, or a search provider on this
+  plan. Message search is unavailable in the pinned Chatto release.
+
+Record all deployment inputs before starting: `CHAT_HOST`,
+`ACME_CONTACT_EMAIL`, `OWNER_LOGIN`, `OWNER_DISPLAY_NAME`,
+`CHATTO_VERSION=v0.4.14`, `CHATTO_AWS_ACCOUNT_ID`, `CHATTO_AWS_REGION`,
+`CHATTO_S3_BUCKET`, `CHATTO_BACKUP_PREFIX`, `CHATTO_SNS_TOPIC_ARN`, the
+operator alert email address, and the restricted `chatto-backup` credentials.
 
 ## Implementation Runbook
 
@@ -34,19 +46,59 @@ Before connecting to the command prompt:
 ### 2. Harden the Base Instance
 
 If the instance was created with `chatto-lightsail-launch.sh` as its Lightsail
-launch script, the packages, swap file, service account, and directories below
-already exist. The launch script cannot reboot or run interactive installs, so
-in that case still `sudo reboot` once to apply the kernel upgrade, then skip
-ahead to the AWS CLI installation.
+launch script, skip the manual preparation below **only** when its completion
+marker exists:
+
+```bash
+sudo test -f /var/log/chatto-launch.complete
+sudo tail -n 100 /var/log/chatto-launch.log
+```
+
+The script removes a stale marker at startup, activates swap before
+`full-upgrade`, retries each APT operation up to five times, and writes the
+marker only at the very end. If the marker is absent, inspect the log, fix the
+reported cause, and rerun the idempotent script with
+`sudo /path/to/chatto-lightsail-launch.sh`, or complete every manual command
+below. Never infer success merely because the instance is reachable.
 
 From the fresh SSH prompt:
 
 ```bash
 sudo apt update
+sudo fallocate -l 1G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/90-chatto-memory.conf
+sudo sysctl --system
 sudo apt full-upgrade -y
-sudo apt install -y ca-certificates curl jq tar age unzip gnupg
+sudo apt install -y \
+  ca-certificates curl jq tar age unzip gnupg unattended-upgrades
+sudo useradd --system --create-home \
+  --home-dir /var/lib/chatto \
+  --shell /usr/sbin/nologin chatto
+sudo install -d -o chatto -g chatto -m 0750 \
+  /etc/chatto /var/lib/chatto/data /var/lib/chatto/certs
+sudo touch /var/log/chatto-launch.complete
 sudo reboot
 ```
+
+The swap commands above are for a fresh instance. On a rerun, use the
+idempotent launch script instead of repeating `fallocate`, `mkswap`, or the
+`fstab` append. On the fully manual path, create the marker only after every
+preceding command succeeds; it carries the same meaning as the script's
+marker.
+
+Reconnect after the reboot and require the launch marker before proceeding:
+
+```bash
+sudo test -f /var/log/chatto-launch.complete
+free -h
+```
+
+If the marker disappeared or was never created, return to the launch log and
+rerun the script. A reboot does not repair a failed bootstrap.
 
 Reconnect and install the official AWS CLI v2 build rather than Debian's
 potentially stale `awscli` package. Copy the public key block published in the
@@ -81,41 +133,32 @@ identify AWS CLI v2 and the `AWS CLI Team <aws-cli@amazon.com>` signing key.
 The signing-key warning about an untrusted certification path is expected; a
 bad signature is not.
 
-Confirm Debian and available resources, then add 1 GiB of emergency swap:
+Confirm Debian, the already-active swap, and available resources:
 
 ```bash
 cat /etc/debian_version
 free -h
 df -h /
-
-sudo fallocate -l 1G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
-echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/90-chatto-memory.conf
-sudo sysctl --system
+swapon --show
 ```
 
-Create a dedicated non-login account and private directories:
+Verify the dedicated non-login account and private directories created by
+either preparation path:
 
 ```bash
-sudo useradd --system --create-home \
-  --home-dir /var/lib/chatto \
-  --shell /usr/sbin/nologin chatto
-
-sudo install -d -o chatto -g chatto -m 0750 \
+getent passwd chatto
+sudo stat -c '%U:%G %a %n' \
   /etc/chatto /var/lib/chatto/data /var/lib/chatto/certs
 ```
 
 ### 3. Install and Verify Chatto
 
-Resolve the latest stable release, download the Linux x86-64 archive and checksum file, verify the archive, and install the binary:
+Install the explicitly pinned release. Do not resolve GitHub's mutable
+`latest` release during deployment:
 
 ```bash
-CHATTO_VERSION=$(curl -fsSL \
-  https://api.github.com/repos/chattocorp/chatto/releases/latest | \
-  jq -r .tag_name)
+CHATTO_VERSION=v0.4.14
+test "${CHATTO_VERSION}" = v0.4.14
 
 CHATTO_ASSET=chatto_Linux_x86_64.tar.gz
 # The checksum asset is version-templated, e.g. chatto_0.4.14_checksums.txt;
@@ -136,7 +179,10 @@ sudo install -o root -g root -m 0755 chatto /usr/local/bin/chatto
 /usr/local/bin/chatto version
 ```
 
-Record the installed version in the deployment notes. Never pipe an unverified download directly into a privileged shell.
+Require `/usr/local/bin/chatto version` to report `v0.4.14`, and record it in
+the deployment notes. Never pipe an unverified download directly into a
+privileged shell. An upgrade must set and record a new explicit target
+`CHATTO_VERSION`; it must never switch back to a “latest release” lookup.
 
 ### 4. Generate and Tune Configuration
 
@@ -195,18 +241,16 @@ real cap is that the operator creates at most 10 accounts.
 Apply the low-resource feature policy:
 
 ```toml
-[search]
-enabled = false
-
-[search_provider]
-enabled = false
-
 [video]
 enabled = false
 
 [livekit]
 enabled = false
 ```
+
+Do not add `[search]` or `[search_provider]`: Chatto v0.4.14 ignores both
+sections. Message search is unavailable in this pinned release without further
+application support; verify the UI does not offer a functioning search path.
 
 Keep embedded NATS and local attachment storage:
 
@@ -236,7 +280,8 @@ The localhost NATS listener is needed by Chatto's backup command and must never 
 
 ### 5. Install the systemd Service
 
-Create `/etc/systemd/system/chatto.service` with:
+Install the repository's `chatto.service` as
+`/etc/systemd/system/chatto.service`. Its contents are:
 
 ```ini
 [Unit]
@@ -276,6 +321,8 @@ WantedBy=multi-user.target
 Validate and start it:
 
 ```bash
+sudo install -o root -g root -m 0644 \
+  chatto.service /etc/systemd/system/chatto.service
 sudo systemd-analyze verify /etc/systemd/system/chatto.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now chatto
@@ -473,6 +520,43 @@ aws s3api put-bucket-policy \
 S3 notes that the first versioning enablement can take up to 15 minutes to
 propagate. Wait 15 minutes before the first production upload.
 
+### Provision the Operations SNS Topic
+
+Using the administrative provisioning identity, create the one permitted
+operations topic and subscribe the operator's email address:
+
+```bash
+CHATTO_ALERT_EMAIL=OPERATOR_EMAIL_ADDRESS
+CHATTO_SNS_TOPIC_ARN=$(aws sns create-topic \
+  --name chatto-operations \
+  --region "${CHATTO_AWS_REGION}" \
+  --query TopicArn --output text)
+
+test "${CHATTO_SNS_TOPIC_ARN}" = \
+  "arn:aws:sns:${CHATTO_AWS_REGION}:${CHATTO_AWS_ACCOUNT_ID}:chatto-operations"
+
+aws sns subscribe \
+  --topic-arn "${CHATTO_SNS_TOPIC_ARN}" \
+  --protocol email \
+  --notification-endpoint "${CHATTO_ALERT_EMAIL}" \
+  --region "${CHATTO_AWS_REGION}"
+```
+
+Open the AWS confirmation email and confirm the subscription. Do not proceed
+until `list-subscriptions-by-topic` returns the email address with a real
+subscription ARN rather than `PendingConfirmation`:
+
+```bash
+aws sns list-subscriptions-by-topic \
+  --topic-arn "${CHATTO_SNS_TOPIC_ARN}" \
+  --region "${CHATTO_AWS_REGION}"
+```
+
+If the provisioning identity is delegated rather than administrative, it
+needs only the SNS topic and subscription actions required above and to inspect
+that one topic. Remove the temporary provisioning permission afterward. The
+server runtime identity receives no subscription or topic-management actions.
+
 ### Create the Runtime IAM User
 
 Have an IAM administrator create a user named `chatto-backup` with no console
@@ -484,9 +568,9 @@ that operator `iam:CreateUser`, `iam:GetUser`, `iam:GetLoginProfile`,
 `arn:aws:iam::AWS_ACCOUNT_ID:user/chatto-backup`. Remove the delegation after
 the user and first key are configured.
 
-Replace the three placeholders below, attach the result to `chatto-backup` as
-an inline policy named `ChattoBackupPrefix`, and do not attach any AWS managed
-S3 policy:
+Replace the bucket, prefix, and SNS topic placeholders below, attach the result
+to `chatto-backup` as an inline policy named `ChattoBackupAndAlerts`, and do
+not attach any AWS managed S3 or SNS policy:
 
 ```json
 {
@@ -522,10 +606,20 @@ S3 policy:
         "s3:ListMultipartUploadParts"
       ],
       "Resource": "arn:aws:s3:::GLOBALLY_UNIQUE_BUCKET_NAME/BACKUP_PREFIX/*"
+    },
+    {
+      "Sid": "PublishOperationsAlerts",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:AWS_REGION:AWS_ACCOUNT_ID:chatto-operations"
     }
   ]
 }
 ```
+
+This combines restricted S3 access with publish-only access to the single
+operations topic. The runtime user cannot create topics, add subscriptions,
+inspect subscription endpoints, or publish to another topic.
 
 Create one access key for the `chatto-backup` user using the IAM console's
 "Application running outside AWS" use case. Record it directly in the external
@@ -556,84 +650,167 @@ the disk is lost.
 
 ### Automate and Verify Backups
 
-Create a local staging directory for archives:
+From this repository, install the implementation, non-secret environment
+file, and hardened units:
 
 ```bash
-sudo install -d -o chatto -g chatto -m 0700 /var/lib/chatto/backups
+sudo install -d -o chatto -g chatto -m 0700 \
+  /var/lib/chatto/backups /var/lib/chatto/operations
+
+sudo install -o root -g root -m 0755 \
+  chatto-lightsail-backup.sh \
+  chatto-lightsail-alert.sh \
+  chatto-lightsail-reboot-required.sh \
+  /usr/local/sbin/
+
+sudo install -o root -g root -m 0644 \
+  chatto-backup.service \
+  chatto-backup.timer \
+  chatto-backup-alert@.service \
+  chatto-reboot-required.service \
+  chatto-reboot-required.timer \
+  /etc/systemd/system/
+
+sed \
+  -e "s/GLOBALLY_UNIQUE_BUCKET_NAME/${CHATTO_S3_BUCKET}/" \
+  -e "s|chatto/backups|${CHATTO_BACKUP_PREFIX}|" \
+  -e "s/AWS_REGION/${CHATTO_AWS_REGION}/g" \
+  -e "s/123456789012/${CHATTO_AWS_ACCOUNT_ID}/g" \
+  chatto-backup.env.example |
+  sudo tee /etc/chatto/backup.env >/dev/null
+
+sudo chown root:root /etc/chatto/backup.env
+sudo chmod 0644 /etc/chatto/backup.env
 ```
 
-Install a daily systemd service (`chatto-backup.service`) and timer
-(`chatto-backup.timer`). The service must run as the service account — it
-needs to read `chatto.toml` and the passphrase file — with at least:
+Review `/etc/chatto/backup.env` and require all five values to be exact,
+including the topic ARN. It is deliberately root-owned and non-secret. AWS
+credentials remain only in `/etc/chatto/aws/credentials`, and the encryption
+passphrase remains only in `/etc/chatto/backup-passphrase`; both secret files
+are owned by `chatto` with mode `0600`.
 
-```ini
-[Service]
-Type=oneshot
-User=chatto
-Group=chatto
-WorkingDirectory=/var/lib/chatto/backups
-Environment=AWS_CONFIG_FILE=/etc/chatto/aws/config
-Environment=AWS_SHARED_CREDENTIALS_FILE=/etc/chatto/aws/credentials
-Environment=AWS_PROFILE=chatto-backup
-Environment=AWS_REGION=AWS_REGION
-Environment=AWS_PAGER=
-```
+The installed `chatto-lightsail-backup.sh` validates its bucket, prefix,
+region, account ID, config, passphrase, tools, and staging directory before it
+starts. It then:
 
-Setting the credentials via environment paths keeps them out of the unit file
-itself.
+1. Creates a UTC-named encrypted `--include-keys` archive using
+   `--passphrase-file`.
+2. Computes the complete file's byte count and SHA-256.
+3. Uploads with an S3-managed SHA-256, `AES256`, full-file digest metadata,
+   and the expected bucket owner.
+4. Uses `head-object --checksum-mode ENABLED` to require matching
+   `ContentLength`, matching digest metadata, a present S3 checksum, and
+   `AES256`.
+5. Deletes older local archives only after that verification, retaining the
+   newest two.
 
-The backup program run by the service must:
-
-1. Run `chatto backup --config /etc/chatto/chatto.toml --encrypt
-   --include-keys --passphrase-file /etc/chatto/backup-passphrase -o
-   "${BACKUP_ARCHIVE}"`. The passphrase file is mandatory here: without it the
-   command prompts interactively, which fails under systemd.
-2. Name the archive (`BACKUP_ARCHIVE`, under `/var/lib/chatto/backups/`) with
-   a UTC timestamp and `.tar.gz.age` suffix.
-3. Calculate its byte count and hexadecimal SHA-256 digest:
-
-   ```bash
-   BACKUP_SIZE=$(stat -c %s "${BACKUP_ARCHIVE}")
-   BACKUP_SHA256=$(sha256sum "${BACKUP_ARCHIVE}" | awk '{print $1}')
-   ```
-
-4. Upload it under `BACKUP_PREFIX/` with explicit encryption, an S3-managed
-   transfer checksum, and the full-file SHA-256 stored as object metadata:
-
-   ```bash
-   /usr/local/bin/aws s3 cp "${BACKUP_ARCHIVE}" \
-     "s3://${S3_BUCKET}/${BACKUP_OBJECT_KEY}" \
-     --region "${AWS_REGION}" \
-     --sse AES256 \
-     --checksum-algorithm SHA256 \
-     --metadata "sha256=${BACKUP_SHA256}" \
-     --only-show-errors
-   ```
-
-5. Run `aws s3api head-object --checksum-mode ENABLED` with
-   `--expected-bucket-owner` and fail unless `ContentLength` equals
-   `BACKUP_SIZE`, `Metadata.sha256` equals `BACKUP_SHA256`,
-   `ChecksumSHA256` is present, and `ServerSideEncryption` equals `AES256`.
-   The S3 checksum can be a composite checksum for multipart uploads, so it
-   must not be compared directly with the full-file digest.
-6. Retain only the newest two local archives, but delete an older local
-   archive only after its replacement has passed the remote verification.
-7. Exit nonzero on backup, upload, or verification failure so the failure is
-   visible in systemd and `journalctl`.
+If upload or verification fails, the completed local archive remains in the
+staging directory and the script exits nonzero. The service uses the protected
+AWS profile, runs at nice level 10 with idle I/O scheduling, orders itself
+after the network and Chatto, and can write only to the backup directory.
+`OnFailure=chatto-backup-alert@%n.service` publishes the failed unit and host to
+the operations topic as the `chatto` user.
 
 Chatto explicitly recommends encrypted backups with included keys for small servers and remote object storage rather than the same disk. [Backup and restore guide](https://docs.chatto.run/guides/operations/backup-restore/)
 
-Do not auto-update a pre-1.0 server. For each upgrade:
+Validate and enable the units, then test both alert paths:
+
+```bash
+sudo systemd-analyze verify \
+  /etc/systemd/system/chatto-backup.service \
+  /etc/systemd/system/chatto-backup.timer \
+  /etc/systemd/system/chatto-backup-alert@.service \
+  /etc/systemd/system/chatto-reboot-required.service \
+  /etc/systemd/system/chatto-reboot-required.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now \
+  chatto-backup.timer chatto-reboot-required.timer
+
+# Direct SNS test; require delivery to the confirmed email subscription.
+sudo -u chatto env \
+  AWS_CONFIG_FILE=/etc/chatto/aws/config \
+  AWS_SHARED_CREDENTIALS_FILE=/etc/chatto/aws/credentials \
+  AWS_PROFILE=chatto-backup \
+  AWS_PAGER= \
+  /usr/local/bin/aws sns publish \
+    --topic-arn "${CHATTO_SNS_TOPIC_ARN}" \
+    --region "${CHATTO_AWS_REGION}" \
+    --subject "Chatto operations test" \
+    --message "Direct SNS delivery test from the Chatto host"
+
+# Produce and remotely verify a real backup.
+sudo systemctl start chatto-backup.service
+sudo systemctl status chatto-backup.service --no-pager
+sudo journalctl -u chatto-backup.service -n 100 --no-pager
+```
+
+Test the automatic failure alert only on the disposable recovery instance:
+temporarily move that instance's passphrase file aside, start
+`chatto-backup.service`, require the service to exit nonzero, restore the
+passphrase file, and require the SNS email to name
+`chatto-backup.service` and the disposable host. The failure occurs before a
+new archive is created; separately, use a deliberately invalid bucket in the
+disposable instance's `backup.env` to verify that a completed local archive is
+left behind when upload fails. Restore the correct environment and run a
+successful backup afterward.
+
+The daily timer runs at 03:00 UTC, is persistent across downtime, and adds up
+to 15 minutes of randomized delay.
+
+### Security Updates and Manual Upgrades
+
+Install this repository's APT policy. It enables unattended package-list
+refresh and upgrades, permits only the Debian security origin, and explicitly
+disables automatic reboot:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  chatto-auto-upgrades.conf /etc/apt/apt.conf.d/20auto-upgrades
+sudo install -o root -g root -m 0644 \
+  chatto-unattended-upgrades.conf \
+  /etc/apt/apt.conf.d/52chatto-unattended-upgrades
+sudo systemctl enable --now unattended-upgrades.service
+
+sudo unattended-upgrade --dry-run --debug
+apt-config dump | grep -E \
+  'Unattended-Upgrade::Allowed-Origins|Automatic-Reboot'
+```
+
+Review the dry run: security-origin packages may be selected; packages only
+from the base, updates, backports, or third-party repositories must not be
+selected automatically. Both automatic-reboot values must be `false`.
+
+`chatto-reboot-required.timer` checks daily at 04:00 UTC with a persistent,
+randomized timer. If `/var/run/reboot-required` exists, it publishes exactly
+one alert for the pending state. It removes its notification state only after
+the Debian marker is absent.
+
+When a reboot is required:
+
+1. Run `sudo systemctl start chatto-backup.service` and require successful S3
+   verification.
+2. Record current readiness and memory, then run `sudo reboot`.
+3. Reconnect and require `chatto.service` to be active, `/healthz` and
+   `/readyz` to succeed, normal login/message access to work, and memory/swap
+   to meet the capacity thresholds.
+4. Run `sudo systemctl start chatto-reboot-required.service`. This confirms
+   `/var/run/reboot-required` is absent and clears
+   `/var/lib/chatto/operations/reboot-required.notified`.
+
+Do not auto-update a pre-1.0 Chatto server. For every Chatto upgrade:
 
 1. Read the release notes.
 2. Start the backup service and require a successful checksum-verified S3
    upload before continuing.
-3. Download and checksum the new binary.
+3. Set an explicit new target such as `CHATTO_VERSION=v0.x.y`, record it, then
+   download and checksum that exact version. Never use a latest-release query.
 4. Stop Chatto.
 5. Preserve the previous binary as `chatto.previous`.
 6. Atomically install the new binary and start Chatto.
 7. Check readiness, login, logs, memory, and admin diagnostics.
 8. Restore the previous binary if startup or compatibility checks fail.
+
+### Restore Testing and Recurring Operations
 
 Test disaster recovery on a temporary instance. Use `aws s3api
 list-objects-v2` restricted to `BACKUP_PREFIX/` to select an archive, inspect it
@@ -648,7 +825,44 @@ rerun `aws configure --profile chatto-backup`, run and verify a test backup,
 then deactivate the old key. Delete the old key only after another scheduled
 backup succeeds. Never keep two active keys longer than the rotation window.
 
+Every month, review:
+
+- `/var/log/unattended-upgrades/` for security-upgrade failures or unexpected
+  origins.
+- `systemctl list-timers` and two days of `chatto-backup.service` history.
+- The SNS topic's subscription list, requiring the operator email to remain
+  confirmed.
+- Root and backup-directory disk use, Chatto RSS, available memory, and swap
+  behavior.
+
+Every quarter, create a disposable recovery instance, download and verify a
+backup's size and full-file digest, restore it, and confirm owner login,
+messages, and attachments. Also repeat the direct and forced-failure SNS tests
+there before destroying it.
+
 ## Verification and Acceptance Criteria
+
+Before copying artifacts to a server, run repository-level static checks:
+
+```bash
+bash -n \
+  chatto-lightsail-launch.sh \
+  chatto-lightsail-backup.sh \
+  chatto-lightsail-alert.sh \
+  chatto-lightsail-reboot-required.sh
+shellcheck \
+  chatto-lightsail-launch.sh \
+  chatto-lightsail-backup.sh \
+  chatto-lightsail-alert.sh \
+  chatto-lightsail-reboot-required.sh
+systemd-analyze verify \
+  chatto.service \
+  chatto-backup.service \
+  chatto-backup.timer \
+  chatto-backup-alert@.service \
+  chatto-reboot-required.service \
+  chatto-reboot-required.timer
+```
 
 Verify the deployment with:
 
@@ -709,7 +923,7 @@ aws s3api get-bucket-policy \
 aws iam get-user --user-name chatto-backup
 aws iam get-user-policy \
   --user-name chatto-backup \
-  --policy-name ChattoBackupPrefix
+  --policy-name ChattoBackupAndAlerts
 aws iam list-user-policies --user-name chatto-backup
 aws iam list-attached-user-policies --user-name chatto-backup
 aws iam list-access-keys --user-name chatto-backup
@@ -721,9 +935,13 @@ sudo systemctl is-enabled chatto-backup.timer
 sudo systemctl list-timers chatto-backup.timer --all
 sudo systemctl status chatto-backup.service --no-pager
 sudo journalctl -u chatto-backup.service --since "2 days ago"
+
+aws sns list-subscriptions-by-topic \
+  --topic-arn "${CHATTO_SNS_TOPIC_ARN}" \
+  --region "${CHATTO_AWS_REGION}"
 ```
 
-The S3 results must show:
+The AWS results must show:
 
 - The bucket is in the Lightsail region. S3 reports `null` or `US` for
   `us-east-1`.
@@ -736,8 +954,12 @@ The S3 results must show:
 - The lifecycle rule applies only to `BACKUP_PREFIX/`, expires current and
   noncurrent objects after 14 days, and aborts incomplete multipart uploads
   after one day.
-- The IAM user has no console password, has only the `ChattoBackupPrefix`
-  inline policy, and normally has exactly one active access key.
+- The IAM user has no console password, has only the
+  `ChattoBackupAndAlerts` inline policy, and normally has exactly one active
+  access key. Its effective permissions are the restricted S3 actions plus
+  only `sns:Publish` on `chatto-operations`.
+- The operator email subscription on `chatto-operations` is confirmed, not
+  pending.
 
 For the newest backup, use the runtime profile to run `list-objects-v2` with
 `--prefix "BACKUP_PREFIX/"` and `head-object --checksum-mode ENABLED`.
@@ -748,8 +970,93 @@ archive and the backup service's recorded values. Also confirm that
 uploads, so the disaster-recovery download is the end-to-end full-file digest
 test.
 
+### Capacity Gate for the $5 Instance
+
+Run this gate on the configured $5 instance before production acceptance.
+From two browsers, sustain normal messaging and realtime activity and upload
+and download a file at the configured 10 MB maximum. While that foreground
+activity continues, run:
+
+```bash
+CAPACITY_START=$(date --iso-8601=seconds)
+sudo systemctl start --no-block chatto-backup.service
+
+# Sample at least every five seconds while the backup is activating or active.
+while systemctl show chatto-backup.service \
+  --property=ActiveState --value |
+  grep -Eq 'activating|active'; do
+  CHATTO_PID=$(systemctl show chatto.service \
+    --property=MainPID --value)
+  date --iso-8601=seconds
+  ps -o pid=,rss=,etimes=,command= -p "${CHATTO_PID}"
+  awk '/MemAvailable|SwapTotal|SwapFree/ {print}' /proc/meminfo
+  df -P / /var/lib/chatto/backups
+  curl --fail --silent --show-error \
+    --resolve CHAT_HOST:443:127.0.0.1 https://CHAT_HOST/healthz
+  curl --fail --silent --show-error \
+    --resolve CHAT_HOST:443:127.0.0.1 https://CHAT_HOST/readyz
+  sudo journalctl -k --since "${CAPACITY_START}" --no-pager |
+    grep -Ei 'out of memory|oom-kill|killed process' || true
+  sleep 5
+done
+
+# Continue the same samples for 15 minutes after the backup finishes.
+for _ in $(seq 1 180); do
+  CHATTO_PID=$(systemctl show chatto.service \
+    --property=MainPID --value)
+  date --iso-8601=seconds
+  ps -o pid=,rss=,etimes=,command= -p "${CHATTO_PID}"
+  awk '/MemAvailable|SwapTotal|SwapFree/ {print}' /proc/meminfo
+  df -P / /var/lib/chatto/backups
+  curl --fail --silent --show-error \
+    --resolve CHAT_HOST:443:127.0.0.1 https://CHAT_HOST/readyz
+  sudo journalctl -k --since "${CAPACITY_START}" --no-pager |
+    grep -Ei 'out of memory|oom-kill|killed process' || true
+  sleep 5
+done
+```
+
+Save the output with the deployment record. Passing requires all of the
+following both during the overlap and for the full 15-minute observation:
+
+- No kernel OOM event or killed Chatto process.
+- Chatto RSS stays below roughly 350 MiB.
+- `/proc/meminfo` reports at least 64 MiB `MemAvailable`.
+- Swap use does not grow continuously across successive samples.
+- Health and readiness stay successful.
+- Root and backup-directory filesystem use stay below 70%.
+
+If any threshold fails, resize to the $7/1 GB public-IPv4 bundle before
+production and rerun the gate. No application redesign is required.
+
+### Disposable Instance Qualification
+
+Before production, exercise the whole runbook on a fresh disposable Debian 13
+instance:
+
+1. Interrupt the launch script during an APT operation and require the
+   completion marker to be absent. Rerun the same script successfully, reboot,
+   and require the marker to exist.
+2. Download the pinned v0.4.14 archive and versioned checksum file, verify it,
+   and require the installed version to match.
+3. Trigger the timer's service three times with distinct UTC timestamps.
+   Require three verified S3 objects and only the newest two verified local
+   archives.
+4. Test direct SNS delivery, then force backup failure and require a nonzero
+   service result plus an email naming the failed unit and disposable host.
+5. Run `unattended-upgrade --dry-run --debug`; require security updates to be
+   eligible, non-security packages not to be selected automatically, and both
+   automatic-reboot settings to remain false.
+6. Run the complete foreground-activity/backup capacity gate.
+7. Download an archive, compare its byte count and full-file SHA-256 with S3
+   `ContentLength` and `Metadata.sha256`, restore it, and verify owner login,
+   messages, and attachments.
+
 Acceptance requires:
 
+- `/var/log/chatto-launch.complete` exists after the bootstrap reboot.
+- `/usr/local/bin/chatto version` reports the recorded pinned
+  `CHATTO_VERSION=v0.4.14`.
 - Public `https://CHAT_HOST` has a valid certificate and redirects HTTP to HTTPS.
 - Owner and ordinary password accounts can log in without email.
 - Messages, realtime updates, image uploads, and small file downloads work between two browsers.
@@ -759,24 +1066,39 @@ Acceptance requires:
 - AWS CLI v2 is installed from a signature-verified official installer.
 - The `chatto-backup` credentials can list only `BACKUP_PREFIX`, read and write
   its objects, and cannot change bucket configuration or access another
-  prefix.
+  prefix; they can publish only to the one `chatto-operations` SNS topic.
 - No AWS key is present in shell history, systemd unit files, logs, or any
   group/world-readable file.
 - A daily encrypted backup appears in S3 with matching size and SHA-256
   checksum and `AES256` server-side encryption, and can be checksum-verified
   and restored on a disposable instance.
-- No kernel OOM events occur.
-- Under normal use, Chatto RSS remains below roughly 350 MiB, at least 64 MiB remains available, swap is not continuously growing, and disk usage stays below 70%.
+- Direct SNS publish and an intentionally failed backup on the disposable
+  recovery instance both deliver email alerts.
+- Unattended upgrades select only Debian security-origin packages and never
+  reboot automatically.
+- The complete capacity gate above passes.
 
-If those memory conditions fail, move unchanged data and configuration to the $7/1 GB public-IPv4 bundle. If attachment growth threatens the 20 GB disk, move attachments to S3 or upgrade storage. Calls, video transcoding, higher concurrency, and high availability are explicitly outside this $5 deployment.
+If attachment growth threatens the 20 GB disk, move attachments to S3 or
+upgrade storage. Calls, video transcoding, higher concurrency, and high
+availability are explicitly outside this deployment.
 
 ## Interfaces and Assumptions
 
 - No Chatto source-code or public API changes are required.
-- New operational interfaces are the systemd service, local operator Unix
-  socket, AWS CLI v2 profile, backup service/timer, and private S3 prefix.
+- New operational interfaces are `chatto-lightsail-backup.sh`,
+  `/etc/chatto/backup.env`, `chatto-backup.service`,
+  `chatto-backup.timer`, `chatto-backup-alert@.service`,
+  `chatto-reboot-required.service`, `chatto-reboot-required.timer`, the local
+  operator Unix socket, AWS CLI v2 profile, private S3 prefix, and
+  `chatto-operations` SNS topic.
 - Required deployment inputs are `CHAT_HOST`, `ACME_CONTACT_EMAIL`,
-  `OWNER_LOGIN`, `OWNER_DISPLAY_NAME`, `AWS_ACCOUNT_ID`, `AWS_REGION`,
-  `S3_BUCKET`, `BACKUP_PREFIX`, and the restricted `chatto-backup`
-  credentials.
+  `OWNER_LOGIN`, `OWNER_DISPLAY_NAME`, `CHATTO_VERSION=v0.4.14`,
+  `CHATTO_AWS_ACCOUNT_ID`, `CHATTO_AWS_REGION`, `CHATTO_S3_BUCKET`,
+  `CHATTO_BACKUP_PREFIX`, `CHATTO_SNS_TOPIC_ARN`, the alert email, and the
+  restricted `chatto-backup` credentials.
+- Chatto remains pinned to v0.4.14 until the manual upgrade procedure records
+  an explicit replacement version. Reboots and Chatto upgrades remain manual.
+- AWS SNS email is the sole external operational-alert channel.
+- The $5/512 MB bundle remains in production only if it passes the capacity
+  gate; resizing to $7/1 GB requires no application redesign.
 - The $5 figure covers the Lightsail instance only. The attached static IPv4 is free; S3 storage/requests and domain registration are separate charges.

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check daily whether Debian requires a reboot
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+Persistent=true
+RandomizedDelaySec=15m
+Unit=chatto-reboot-required.service
+
+[Install]
+WantedBy=timers.target
