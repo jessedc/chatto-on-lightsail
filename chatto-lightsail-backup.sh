@@ -52,12 +52,12 @@ require_executable "${JQ_BIN}"
 require_executable "${SHA256SUM_BIN}"
 require_executable "${STAT_BIN}"
 
-[ -r "${CHATTO_CONFIG}" ] && [ -s "${CHATTO_CONFIG}" ] ||
+{ [ -r "${CHATTO_CONFIG}" ] && [ -s "${CHATTO_CONFIG}" ]; } ||
   fail "Chatto configuration is missing, empty, or unreadable: ${CHATTO_CONFIG}"
-[ -r "${CHATTO_BACKUP_PASSPHRASE_FILE}" ] &&
-  [ -s "${CHATTO_BACKUP_PASSPHRASE_FILE}" ] ||
+{ [ -r "${CHATTO_BACKUP_PASSPHRASE_FILE}" ] &&
+  [ -s "${CHATTO_BACKUP_PASSPHRASE_FILE}" ]; } ||
   fail "backup passphrase is missing, empty, or unreadable: ${CHATTO_BACKUP_PASSPHRASE_FILE}"
-[ -d "${CHATTO_BACKUP_DIR}" ] && [ -w "${CHATTO_BACKUP_DIR}" ] ||
+{ [ -d "${CHATTO_BACKUP_DIR}" ] && [ -w "${CHATTO_BACKUP_DIR}" ]; } ||
   fail "backup staging directory is missing or not writable: ${CHATTO_BACKUP_DIR}"
 
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -66,7 +66,7 @@ archive_path="${CHATTO_BACKUP_DIR}/${archive_name}"
 partial_path="${archive_path}.partial"
 object_key="${CHATTO_BACKUP_PREFIX}/${archive_name}"
 
-[ ! -e "${archive_path}" ] && [ ! -e "${partial_path}" ] ||
+{ [ ! -e "${archive_path}" ] && [ ! -e "${partial_path}" ]; } ||
   fail "refusing to overwrite an archive created in the same UTC second"
 
 cleanup_partial() {

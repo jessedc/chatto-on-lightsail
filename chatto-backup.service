@@ -34,5 +34,5 @@ RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/var/lib/chatto/backups
 
-[Install]
-WantedBy=multi-user.target
+# No [Install] section: this oneshot is started only by chatto-backup.timer.
+# Enabling the service directly would run a backup at every boot.

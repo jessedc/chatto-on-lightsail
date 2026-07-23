@@ -20,7 +20,7 @@ state_dir=${CHATTO_REBOOT_STATE_FILE%/*}
   echo "reboot check: CHATTO_AWS_REGION is required" >&2
   exit 1
 }
-[ -d "${state_dir}" ] && [ -w "${state_dir}" ] || {
+{ [ -d "${state_dir}" ] && [ -w "${state_dir}" ]; } || {
   echo "reboot check: state directory is missing or not writable: ${state_dir}" >&2
   exit 1
 }

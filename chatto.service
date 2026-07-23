@@ -2,6 +2,12 @@
 Description=Chatto
 After=network-online.target
 Wants=network-online.target
+# With RestartSec=5, the default 5-starts-per-10s limit is never exhausted,
+# so a crash loop would restart forever without alerting. Five failures
+# within 10 minutes stops the unit and publishes to the operations topic.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+OnFailure=chatto-backup-alert@%n.service
 
 [Service]
 Type=simple

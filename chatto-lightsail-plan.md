@@ -288,6 +288,12 @@ Install the repository's `chatto.service` as
 Description=Chatto
 After=network-online.target
 Wants=network-online.target
+# With RestartSec=5, the default 5-starts-per-10s limit is never exhausted,
+# so a crash loop would restart forever without alerting. Five failures
+# within 10 minutes stops the unit and publishes to the operations topic.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+OnFailure=chatto-backup-alert@%n.service
 
 [Service]
 Type=simple
@@ -329,6 +335,16 @@ sudo systemctl enable --now chatto
 sudo systemctl status chatto --no-pager
 sudo journalctl -u chatto -n 100 --no-pager
 ```
+
+If Chatto fails five times within ten minutes, the unit stops restarting and
+`OnFailure=` publishes to the operations topic through the same alert template
+the backup uses. That delivery works only after the backup environment file,
+AWS profile, and SNS topic from the operations section exist; until then a
+Chatto failure logs a failed `chatto-backup-alert@` instance without email.
+After fixing the underlying cause of a crash loop, run
+`sudo systemctl reset-failed chatto` and then `sudo systemctl start chatto`;
+while the start limit is tripped, a plain start is refused until the
+ten-minute window lapses.
 
 ### 6. Bootstrap Operator-Managed Accounts
 
@@ -641,12 +657,20 @@ sudo chmod 0600 \
 ```
 
 Enter the access key ID, secret access key, the Lightsail region, and `json`
-when prompted. The prompt keeps the secret out of shell history. Store a
-randomly generated backup passphrase in `/etc/chatto/backup-passphrase`, owned
-by `chatto`, mode `0600`; the backup service reads it with
-`--passphrase-file`. Keep a second copy of the passphrase and `chatto.toml`
-in the external password manager; neither is recoverable from the server if
-the disk is lost.
+when prompted. The prompt keeps the secret out of shell history. Generate the
+backup passphrase directly into its protected file so it never appears in
+shell history or process listings:
+
+```bash
+sudo install -m 0600 -o chatto -g chatto /dev/null \
+  /etc/chatto/backup-passphrase
+openssl rand -base64 48 |
+  sudo tee /etc/chatto/backup-passphrase >/dev/null
+```
+
+The backup service reads it with `--passphrase-file`. Keep a second copy of
+the passphrase and `chatto.toml` in the external password manager; neither is
+recoverable from the server if the disk is lost.
 
 ### Automate and Verify Backups
 
@@ -671,13 +695,24 @@ sudo install -o root -g root -m 0644 \
   chatto-reboot-required.timer \
   /etc/systemd/system/
 
+# These four values come from the recorded deployment inputs; this step
+# usually runs in a fresh SSH session, so set them again here. The loop
+# aborts generation if any is unset or empty.
+for required in CHATTO_S3_BUCKET CHATTO_BACKUP_PREFIX \
+  CHATTO_AWS_REGION CHATTO_AWS_ACCOUNT_ID; do
+  test -n "${!required}" || { echo "unset: ${required}" >&2; false; }
+done
+
 sed \
-  -e "s/GLOBALLY_UNIQUE_BUCKET_NAME/${CHATTO_S3_BUCKET}/" \
-  -e "s|chatto/backups|${CHATTO_BACKUP_PREFIX}|" \
-  -e "s/AWS_REGION/${CHATTO_AWS_REGION}/g" \
-  -e "s/123456789012/${CHATTO_AWS_ACCOUNT_ID}/g" \
+  -e "s|@CHATTO_S3_BUCKET@|${CHATTO_S3_BUCKET}|" \
+  -e "s|@CHATTO_BACKUP_PREFIX@|${CHATTO_BACKUP_PREFIX}|" \
+  -e "s|@CHATTO_AWS_REGION@|${CHATTO_AWS_REGION}|g" \
+  -e "s|@CHATTO_AWS_ACCOUNT_ID@|${CHATTO_AWS_ACCOUNT_ID}|g" \
   chatto-backup.env.example |
   sudo tee /etc/chatto/backup.env >/dev/null
+
+# No placeholder may survive substitution.
+! grep -F '@' /etc/chatto/backup.env
 
 sudo chown root:root /etc/chatto/backup.env
 sudo chmod 0644 /etc/chatto/backup.env
@@ -800,15 +835,21 @@ When a reboot is required:
 Do not auto-update a pre-1.0 Chatto server. For every Chatto upgrade:
 
 1. Read the release notes.
-2. Start the backup service and require a successful checksum-verified S3
+2. Stop the backup timer for the maintenance window with
+   `sudo systemctl stop chatto-backup.timer`. The backup service declares
+   `Requires=chatto.service`, so a timer that fires mid-upgrade would silently
+   start a deliberately stopped Chatto.
+3. Start the backup service and require a successful checksum-verified S3
    upload before continuing.
-3. Set an explicit new target such as `CHATTO_VERSION=v0.x.y`, record it, then
+4. Set an explicit new target such as `CHATTO_VERSION=v0.x.y`, record it, then
    download and checksum that exact version. Never use a latest-release query.
-4. Stop Chatto.
-5. Preserve the previous binary as `chatto.previous`.
-6. Atomically install the new binary and start Chatto.
-7. Check readiness, login, logs, memory, and admin diagnostics.
-8. Restore the previous binary if startup or compatibility checks fail.
+5. Stop Chatto.
+6. Preserve the previous binary as `chatto.previous`.
+7. Atomically install the new binary and start Chatto.
+8. Check readiness, login, logs, memory, and admin diagnostics.
+9. Restore the previous binary if startup or compatibility checks fail.
+10. Restart the backup timer with `sudo systemctl start chatto-backup.timer`
+    and confirm it is scheduled with `systemctl list-timers chatto-backup.timer`.
 
 ### Restore Testing and Recurring Operations
 
@@ -817,8 +858,27 @@ list-objects-v2` restricted to `BACKUP_PREFIX/` to select an archive, inspect it
 with `head-object --checksum-mode ENABLED`, and download it with `aws s3 cp`.
 Recompute the downloaded file's size and full-file SHA-256 and compare them
 with `ContentLength` and `Metadata.sha256` before decrypting it. Then stop
-Chatto, restore with the passphrase, start it, and confirm the owner can log in
-and read messages and attachments.
+Chatto and restore. Chatto must not be running during a restore; encryption is
+auto-detected from the archive, and because the archives are created with
+`--include-keys`, the keys are restored automatically with no separate import
+step. The default restore refuses to touch existing streams, so the
+disaster-recovery rehearsal on an instance that has already run Chatto uses
+`--conflict=overwrite`:
+
+```bash
+sudo systemctl stop chatto
+cd /var/lib/chatto
+sudo -u chatto /usr/local/bin/chatto restore \
+  /var/lib/chatto/backups/DOWNLOADED_ARCHIVE.tar.gz.age \
+  -c /etc/chatto/chatto.toml \
+  --passphrase-file /etc/chatto/backup-passphrase \
+  --conflict=overwrite
+sudo systemctl start chatto
+```
+
+Restore requires the server's `chatto.toml`; on a true disaster-recovery
+instance, recreate it from the password-manager copy first. After starting,
+confirm the owner can log in and read messages and attachments.
 
 Rotate the server access key without downtime: create a second access key,
 rerun `aws configure --profile chatto-backup`, run and verify a test backup,
@@ -982,9 +1042,11 @@ CAPACITY_START=$(date --iso-8601=seconds)
 sudo systemctl start --no-block chatto-backup.service
 
 # Sample at least every five seconds while the backup is activating or active.
+# -x matches the whole state: a successful oneshot ends as "inactive",
+# which a substring match for "active" would treat as still running.
 while systemctl show chatto-backup.service \
   --property=ActiveState --value |
-  grep -Eq 'activating|active'; do
+  grep -Exq 'activating|active'; do
   CHATTO_PID=$(systemctl show chatto.service \
     --property=MainPID --value)
   date --iso-8601=seconds
