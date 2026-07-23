@@ -1,4 +1,5 @@
 aws-cli-public-key.asc
+tailscale-archive-keyring.gpg
 chatto-operator-lib.sh
 install-host.sh
 verify-deployment.sh

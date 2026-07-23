@@ -68,7 +68,7 @@ validate_provisioned_deployment_env
 
 for command_name in \
   apt-config awk basename curl df grep journalctl jq ps runuser sha256sum \
-  ss stat systemctl systemd-analyze; do
+  ss stat systemctl systemd-analyze tailscale; do
   require_command "${command_name}"
 done
 
@@ -277,6 +277,57 @@ grep -Fq "\${distro_id}:\${distro_codename}-security" \
   /etc/apt/apt.conf.d/52chatto-unattended-upgrades ||
   operator_die "the Debian security-only origin is not configured"
 
+operator_log "Checking Tailscale administrative access"
+systemctl is-active --quiet tailscaled ||
+  operator_die "tailscaled is not active"
+systemctl is-enabled --quiet tailscaled ||
+  operator_die "tailscaled is not enabled"
+tailscale_status=$(tailscale status --json)
+[ "$(jq -er '.BackendState' <<<"${tailscale_status}")" = Running ] ||
+  operator_die "Tailscale is not in the Running state"
+tailnet_ip=$(jq -er '.Self.TailscaleIPs[0]' <<<"${tailscale_status}") ||
+  operator_die "the host has no tailnet address"
+tailnet_name=$(jq -er '.Self.DNSName' <<<"${tailscale_status}")
+operator_log "Tailnet address ${tailnet_ip} (${tailnet_name%.})"
+
+tailscale_prefs=$(tailscale debug prefs)
+jq -e '.RunSSH != true' <<<"${tailscale_prefs}" >/dev/null ||
+  operator_die "Tailscale SSH must remain disabled; host sshd is the only SSH server"
+# An advertised exit node appears as 0.0.0.0/0 and ::/0 routes, so an empty
+# route list also proves the host is not an exit node.
+jq -e '(.AdvertiseRoutes // []) | length == 0' \
+  <<<"${tailscale_prefs}" >/dev/null ||
+  operator_die "the host must not advertise tailnet routes or an exit node"
+
+if compgen -G '/etc/chatto/.tailscale-authkey.*' >/dev/null; then
+  operator_die "leftover Tailscale auth-key material exists under /etc/chatto"
+fi
+
+# tailscaled's peer API legitimately listens on the host's own tailnet
+# addresses; anything else would expose it beyond the tailnet.
+tailscale_listeners=$(ss -H -ltnp | awk '/"tailscaled"/ {print $4}')
+while IFS= read -r tailscale_listener; do
+  [ -n "${tailscale_listener}" ] || continue
+  listener_address=${tailscale_listener%:*}
+  listener_address=${listener_address#[}
+  listener_address=${listener_address%]}
+  jq -e --arg address "${listener_address}" \
+    '.Self.TailscaleIPs | index($address) != null' \
+    <<<"${tailscale_status}" >/dev/null ||
+    operator_die \
+      "tailscaled is listening on a non-tailnet address: ${tailscale_listener}"
+done <<<"${tailscale_listeners}"
+
+# Tagged nodes have no node-key expiry. An untagged node with a pending
+# expiry will silently lose tailnet SSH when the key lapses.
+node_key_expiry=$(jq -r '.Self.KeyExpiry // empty' <<<"${tailscale_status}")
+if jq -e '(.Self.Tags // []) | length == 0' \
+  <<<"${tailscale_status}" >/dev/null &&
+  [ -n "${node_key_expiry}" ] && [[ "${node_key_expiry}" != 0001-* ]]; then
+  operator_warn \
+    "the node key expires ${node_key_expiry}; use a tagged node or disable key expiry in the Tailscale admin console"
+fi
+
 capacity_previous_swap=-1
 capacity_swap_growth=0
 
@@ -355,6 +406,7 @@ if [ "${RUN_CAPACITY}" = true ]; then
 fi
 
 operator_log "Deployment verification completed successfully"
+operator_log "Close public TCP 22 on both the IPv4 and IPv6 Lightsail firewalls only after a tailnet SSH session succeeds; follow runbook section 7."
 if [ "${SEND_ALERT}" = true ]; then
   operator_log "Confirm that ${CHATTO_ALERT_EMAIL} received the SNS test message."
 fi

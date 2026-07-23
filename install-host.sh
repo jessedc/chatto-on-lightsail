@@ -14,12 +14,16 @@ INSTALL_TEMP_DIR=
 AWS_CONFIG_TEMP=
 AWS_CREDENTIALS_TEMP=
 AWS_CLI_FINGERPRINT=FB5DB77FD5C118B80511ADA8A6310ACC4672475C
+TAILSCALE_AUTHKEY_FILE=
+TAILSCALE_KEY_TEMP=
+TAILSCALE_KEYRING_FINGERPRINT=2596A99EAAB33821893C0A79458CA832957F5868
 
 usage() {
   cat <<'EOF'
 Usage:
   sudo ./install-host.sh prepare
-  sudo ./install-host.sh install --env FILE [--credentials FILE] [--skip-owner]
+  sudo ./install-host.sh install --env FILE [--credentials FILE]
+      [--tailscale-authkey FILE] [--skip-owner]
 
 prepare
   Idempotently installs base packages, swap, the chatto service account, and
@@ -27,13 +31,19 @@ prepare
 
 install
   Requires the completed prepare phase and reboot. It installs signature-
-  verified AWS CLI v2, checksum-verified Chatto v0.4.14, configuration,
-  systemd units, backup automation, and security-update policy.
+  verified AWS CLI v2, checksum-verified Chatto v0.4.14, signature-pinned
+  Tailscale, configuration, systemd units, backup automation, and
+  security-update policy.
 
 --credentials FILE
   Read AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from a mode-0600 literal
   KEY=VALUE file produced by provision-aws.sh. If omitted and credentials are
   not already installed, the script prompts without echoing the secret.
+
+--tailscale-authkey FILE
+  Read TS_AUTHKEY from a mode-0600 literal KEY=VALUE file holding a
+  pre-authorized, non-reusable Tailscale auth key tagged tag:chatto. Required
+  only while the host is not yet enrolled in the tailnet.
 
 --skip-owner
   Do not create the first owner account. The command prints the exact follow-up
@@ -47,6 +57,9 @@ cleanup() {
   fi
   if [[ "${AWS_CREDENTIALS_TEMP}" == /etc/chatto/aws/.credentials.* ]]; then
     rm -f -- "${AWS_CREDENTIALS_TEMP}"
+  fi
+  if [[ "${TAILSCALE_KEY_TEMP}" == /etc/chatto/.tailscale-authkey.* ]]; then
+    rm -f -- "${TAILSCALE_KEY_TEMP}"
   fi
   if [ -n "${INSTALL_TEMP_DIR}" ] &&
     [[ "${INSTALL_TEMP_DIR}" == /tmp/chatto-host-install.* ]]; then
@@ -70,6 +83,11 @@ while [ "$#" -gt 0 ]; do
     --credentials)
       [ "$#" -ge 2 ] || operator_die "--credentials requires a file"
       CREDENTIALS_FILE=$2
+      shift 2
+      ;;
+    --tailscale-authkey)
+      [ "$#" -ge 2 ] || operator_die "--tailscale-authkey requires a file"
+      TAILSCALE_AUTHKEY_FILE=$2
       shift 2
       ;;
     --skip-owner)
@@ -165,6 +183,122 @@ install_aws_cli() {
     "${install_args[@]}"
   /usr/local/bin/aws --version 2>&1 | grep -q '^aws-cli/2\.' ||
     operator_die "AWS CLI v2 installation did not validate"
+}
+
+install_tailscale() {
+  local fingerprint
+  local gpg_dir="${INSTALL_TEMP_DIR}/gnupg-tailscale"
+
+  if dpkg -s tailscale >/dev/null 2>&1 &&
+    command -v tailscale >/dev/null 2>&1; then
+    operator_log "Tailscale is already installed"
+  else
+    mkdir -m 0700 "${gpg_dir}"
+    GNUPGHOME=${gpg_dir} gpg --batch \
+      --import "${SCRIPT_DIR}/tailscale-archive-keyring.gpg" >/dev/null 2>&1
+    fingerprint=$(GNUPGHOME=${gpg_dir} gpg --batch --with-colons \
+      --fingerprint 458CA832957F5868 |
+      awk -F: '$1 == "fpr" { print $10; exit }')
+    [ "${fingerprint}" = "${TAILSCALE_KEYRING_FINGERPRINT}" ] ||
+      operator_die "the bundled Tailscale signing key has an unexpected fingerprint"
+
+    operator_log "Installing Tailscale from the pinned official repository"
+    install -o root -g root -m 0644 \
+      "${SCRIPT_DIR}/tailscale-archive-keyring.gpg" \
+      /usr/share/keyrings/tailscale-archive-keyring.gpg
+    printf 'deb [signed-by=%s] %s trixie main\n' \
+      /usr/share/keyrings/tailscale-archive-keyring.gpg \
+      https://pkgs.tailscale.com/stable/debian \
+      > /etc/apt/sources.list.d/tailscale.list
+    chmod 0644 /etc/apt/sources.list.d/tailscale.list
+    apt-get -o DPkg::Lock::Timeout=300 update
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 \
+      install -y tailscale
+  fi
+  systemctl enable --now tailscaled
+}
+
+load_tailscale_authkey() {
+  local authkey_file=$1
+  local line
+  local name
+  local value
+  local seen='|'
+  local mode
+
+  [ -f "${authkey_file}" ] && [ ! -L "${authkey_file}" ] ||
+    operator_die "the Tailscale auth-key input must be a regular, non-symlink file"
+  mode=$(stat -c %a "${authkey_file}")
+  (( (8#${mode} & 8#077) == 0 )) ||
+    operator_die "the Tailscale auth-key input must not be readable by group or other users"
+
+  unset TS_AUTHKEY
+  while IFS= read -r line || [ -n "${line}" ]; do
+    line=${line%$'\r'}
+    case "${line}" in
+      '' | \#*)
+        continue
+        ;;
+    esac
+    [[ "${line}" == *=* ]] ||
+      operator_die "invalid Tailscale auth-key input line"
+    name=${line%%=*}
+    value=${line#*=}
+    [ "${name}" = TS_AUTHKEY ] ||
+      operator_die "unsupported Tailscale auth-key variable: ${name}"
+    case "${seen}" in
+      *"|${name}|"*)
+        operator_die "duplicate Tailscale auth-key variable: ${name}"
+        ;;
+    esac
+    printf -v "${name}" '%s' "${value}"
+    seen="${seen}${name}|"
+  done < "${authkey_file}"
+
+  [[ "${TS_AUTHKEY:-}" == tskey-auth-* ]] ||
+    operator_die "TS_AUTHKEY must hold a tskey-auth-... Tailscale auth key"
+}
+
+enroll_tailscale() {
+  local backend_state
+  local tailnet_ip
+
+  backend_state=$(tailscale status --json 2>/dev/null |
+    jq -r '.BackendState' || true)
+  if [ "${backend_state}" = Running ]; then
+    # Rename an enrolled node with `tailscale set --hostname`;
+    # re-enrollment is never required for that.
+    operator_log "Tailscale is already enrolled in the tailnet"
+    return
+  fi
+
+  [ -n "${TAILSCALE_AUTHKEY_FILE}" ] ||
+    operator_die \
+      "Tailscale is not enrolled; create a pre-authorized, non-reusable auth key tagged tag:chatto in the Tailscale admin console and rerun with --tailscale-authkey FILE"
+  load_tailscale_authkey "${TAILSCALE_AUTHKEY_FILE}"
+
+  TAILSCALE_KEY_TEMP=$(mktemp /etc/chatto/.tailscale-authkey.XXXXXX)
+  chmod 0600 "${TAILSCALE_KEY_TEMP}"
+  printf '%s\n' "${TS_AUTHKEY}" > "${TAILSCALE_KEY_TEMP}"
+  unset TS_AUTHKEY
+
+  operator_log "Enrolling this host in the tailnet as ${TAILSCALE_HOSTNAME}"
+  # Deliberately without --ssh: host sshd stays the only SSH server, and only
+  # the network path moves onto the tailnet.
+  tailscale up \
+    --auth-key "file:${TAILSCALE_KEY_TEMP}" \
+    --hostname "${TAILSCALE_HOSTNAME}" \
+    --timeout 30s ||
+    operator_die \
+      "tailscale up failed; the auth key is likely expired, already consumed, or missing tag:chatto. Mint a new key and rerun the install phase"
+  rm -f -- "${TAILSCALE_KEY_TEMP}"
+  TAILSCALE_KEY_TEMP=
+
+  backend_state=$(tailscale status --json | jq -er '.BackendState')
+  [ "${backend_state}" = Running ] ||
+    operator_die "Tailscale enrollment did not reach the Running state"
+  tailnet_ip=$(tailscale status --json | jq -er '.Self.TailscaleIPs[0]')
+  operator_log "Tailscale is enrolled with tailnet address ${tailnet_ip}"
 }
 
 install_chatto_binary() {
@@ -514,7 +648,7 @@ if [ "${ACTION}" = prepare ]; then
   operator_log "Running idempotent base-instance preparation"
   bash "${SCRIPT_DIR}/chatto-lightsail-launch.sh"
   operator_log "Prepare phase completed. Reboot now, reconnect, then run:"
-  operator_log "  sudo ./install-host.sh install --env chatto-provisioned.env --credentials chatto-access-key.env"
+  operator_log "  sudo ./install-host.sh install --env chatto-provisioned.env --credentials chatto-access-key.env --tailscale-authkey chatto-tailscale-authkey.env"
   exit 0
 fi
 
@@ -535,6 +669,7 @@ fi
 
 for artifact in \
   aws-cli-public-key.asc \
+  tailscale-archive-keyring.gpg \
   chatto.service \
   chatto-backup.service \
   chatto-backup.timer \
@@ -564,6 +699,7 @@ require_command unzip
 INSTALL_TEMP_DIR=$(mktemp -d /tmp/chatto-host-install.XXXXXX)
 install_aws_cli
 install_chatto_binary
+install_tailscale
 
 if [ ! -s /etc/chatto/chatto.toml ]; then
   operator_log "Generating Chatto secret configuration"
@@ -607,6 +743,11 @@ configure_owner
 systemctl enable --now \
   chatto-backup.timer chatto-reboot-required.timer
 
+# Enrollment runs last so a bad or expired auth key never blocks the chat
+# service installation; a rerun skips every completed step above.
+enroll_tailscale
+
 operator_log "Host installation completed successfully"
-operator_log "Remove any transferred credential file after storing its secret safely."
+operator_log "Remove any transferred credential and auth-key file after storing its secret safely."
+operator_log "Keep public TCP 22 open until a tailnet SSH session succeeds; follow runbook section 7 before closing it."
 operator_log "Next, run: sudo ./verify-deployment.sh --run-backup --send-alert"

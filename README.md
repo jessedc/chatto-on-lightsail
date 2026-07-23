@@ -13,15 +13,33 @@ manual fallback, operational procedures, and acceptance rationale are in
 ## Before installation
 
 Create the Debian 13 instance, attach a static IPv4 address, and point the
-chosen chat hostname at it. Configure both Lightsail firewalls:
+chosen chat hostname at it. Configure both Lightsail firewalls with the
+bootstrap rules:
 
 - TCP 80 and 443 from anywhere.
-- TCP 22 only from the operator's public IP where practical.
+- TCP 22 only from the operator's public IP where practical. This rule is
+  temporary: administrative SSH moves onto the tailnet, and section 4 removes
+  public TCP 22 from both firewalls.
 - No other inbound ports.
 
 Install AWS CLI v2 and `jq` on the operator workstation. Authenticate AWS CLI
 with the administrative identity that may provision the backup bucket, SNS
 topic, and restricted IAM user.
+
+Prepare the tailnet on a Tailscale account whose workstation and other
+operator devices are already enrolled:
+
+- Add `tag:chatto` to the tailnet policy file, for example
+  `"tagOwners": { "tag:chatto": ["autogroup:admin"] }`. Tagged nodes have no
+  node-key expiry, so tailnet SSH never lapses silently.
+- In the admin console, create an auth key that is pre-authorized,
+  **not** reusable, not ephemeral, and tagged `tag:chatto`.
+- Save it on the workstation as a one-time input file:
+
+```bash
+printf 'TS_AUTHKEY=tskey-auth-REPLACE\n' > chatto-tailscale-authkey.env
+chmod 0600 chatto-tailscale-authkey.env
+```
 
 Copy and edit the literal deployment input file:
 
@@ -79,12 +97,14 @@ scp \
   /tmp/chatto-host-installer.tgz \
   chatto-provisioned.env \
   chatto-access-key.env \
+  chatto-tailscale-authkey.env \
   admin@LIGHTSAIL_IP:
 
 ssh admin@LIGHTSAIL_IP
 mkdir -p chatto-on-lightsail
 tar -xzf chatto-host-installer.tgz -C chatto-on-lightsail
-mv chatto-provisioned.env chatto-access-key.env chatto-on-lightsail/
+mv chatto-provisioned.env chatto-access-key.env \
+  chatto-tailscale-authkey.env chatto-on-lightsail/
 cd chatto-on-lightsail
 chmod +x install-host.sh verify-deployment.sh
 ```
@@ -109,13 +129,17 @@ Reconnect after the instance returns:
 cd chatto-on-lightsail
 sudo ./install-host.sh install \
   --env chatto-provisioned.env \
-  --credentials chatto-access-key.env
+  --credentials chatto-access-key.env \
+  --tailscale-authkey chatto-tailscale-authkey.env
 ```
 
 The install phase:
 
 - Signature-verifies and installs official AWS CLI v2.
 - Checksum-verifies and installs Chatto `v0.4.14`.
+- Installs fingerprint-pinned Tailscale from the official Debian repository
+  and enrolls the host in the tailnet, deliberately without Tailscale SSH:
+  host `sshd` and the Lightsail keypair stay the only SSH path.
 - Generates Chatto's secret-bearing configuration without overwriting it on a
   rerun.
 - Installs the low-memory, private-community policy through
@@ -126,15 +150,17 @@ The install phase:
 - Prompts Chatto to create the owner password without placing it in shell
   history.
 
-After it succeeds, remove the transferred access-key file from the server. The
-installed copy remains protected at `/etc/chatto/aws/credentials`:
+After it succeeds, remove the transferred secret files from the server. The
+installed AWS copy remains protected at `/etc/chatto/aws/credentials`, and the
+consumed Tailscale auth key is single-use:
 
 ```bash
-rm chatto-access-key.env
+rm chatto-access-key.env chatto-tailscale-authkey.env
 ```
 
-Remove the workstation copy after confirming its value is safely stored in the
-password manager.
+Remove the workstation copies after confirming the access-key value is safely
+stored in the password manager. The auth key needs no copy: a future
+re-enrollment uses a freshly minted key.
 
 ## 4. Verify the deployment
 
@@ -168,6 +194,22 @@ Resize to the $7/1 GB bundle and rerun the gate if any threshold fails.
 Quarterly restore rehearsal and ongoing maintenance remain human operational
 responsibilities; follow the full runbook.
 
+## 5. Move SSH onto the tailnet
+
+Only after `verify-deployment.sh` passes, open a **new** terminal on the
+workstation while keeping the existing public-IP session connected, and
+confirm SSH over the tailnet:
+
+```bash
+ssh admin@chatto
+```
+
+Use `ssh admin@TAILNET_IP` with the address printed by the verification if
+MagicDNS is disabled. Once that session works, remove TCP 22 from **both** the
+IPv4 and the IPv6 Lightsail firewalls, confirm `ssh admin@LIGHTSAIL_IP` now
+times out, and test break-glass access once. Runbook section 7 has the full
+procedure, the exact firewall command, failure modes, and rollback.
+
 ## Repository validation
 
 The non-destructive workflow test uses a deterministic AWS CLI stand-in:
@@ -192,6 +234,11 @@ shellcheck -x \
 - `install-host.sh prepare` may be rerun safely after a partial base setup.
 - `install-host.sh install` preserves existing Chatto secrets, AWS
   credentials, the backup passphrase, and the recorded owner.
+- `install-host.sh install` skips Tailscale enrollment while the node is
+  already `Running`; a fresh enrollment always needs a newly minted auth key.
+- If the tailnet is ever unreachable after public TCP 22 was closed, re-add
+  TCP 22 restricted to the operator's IP through the Lightsail console or CLI
+  (break-glass), then repair Tailscale over plain SSH.
 - `provision-aws.sh` reconciles resource controls but refuses unexpected IAM
   policies, console access, extra keys, or a mismatched AWS account.
 - Neither installer upgrades or downgrades an existing different Chatto

@@ -41,7 +41,8 @@ deployment_variable_names() {
     CHATTO_S3_BUCKET \
     CHATTO_BACKUP_PREFIX \
     CHATTO_SNS_TOPIC_ARN \
-    CHATTO_ALERT_EMAIL
+    CHATTO_ALERT_EMAIL \
+    TAILSCALE_HOSTNAME
 }
 
 is_deployment_variable() {
@@ -49,7 +50,7 @@ is_deployment_variable() {
     CHAT_HOST | ACME_CONTACT_EMAIL | OWNER_LOGIN | OWNER_DISPLAY_NAME | \
       CHATTO_VERSION | CHATTO_AWS_ACCOUNT_ID | CHATTO_AWS_REGION | \
       CHATTO_S3_BUCKET | CHATTO_BACKUP_PREFIX | CHATTO_SNS_TOPIC_ARN | \
-      CHATTO_ALERT_EMAIL)
+      CHATTO_ALERT_EMAIL | TAILSCALE_HOSTNAME)
       return 0
       ;;
     *)
@@ -157,6 +158,18 @@ validate_aws_identifiers() {
       "CHATTO_BACKUP_PREFIX may contain only letters, digits, dot, underscore, hyphen, and slash"
 }
 
+# TAILSCALE_HOSTNAME is optional so pre-Tailscale deployment env files stay
+# valid; an empty value normalizes to the default machine name.
+validate_tailscale_hostname() {
+  if [ -z "${TAILSCALE_HOSTNAME:-}" ]; then
+    TAILSCALE_HOSTNAME=chatto
+  fi
+  [ "${#TAILSCALE_HOSTNAME}" -le 63 ] &&
+    [[ "${TAILSCALE_HOSTNAME}" != *[!A-Za-z0-9-]* ]] &&
+    [[ "${TAILSCALE_HOSTNAME}" != -* && "${TAILSCALE_HOSTNAME}" != *- ]] ||
+    operator_die "TAILSCALE_HOSTNAME must be a single valid DNS label"
+}
+
 validate_base_deployment_env() {
   local normalized_owner_login
 
@@ -190,6 +203,7 @@ validate_base_deployment_env() {
   esac
   [ "${CHATTO_VERSION}" = v0.4.14 ] ||
     operator_die "CHATTO_VERSION must remain pinned to the qualified v0.4.14 release"
+  validate_tailscale_hostname
   validate_aws_identifiers
 }
 
