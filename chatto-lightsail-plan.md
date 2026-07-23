@@ -34,11 +34,44 @@ From the fresh SSH prompt:
 ```bash
 sudo apt update
 sudo apt full-upgrade -y
-sudo apt install -y ca-certificates curl jq tar age awscli
+sudo apt install -y ca-certificates curl jq tar age unzip gnupg
 sudo reboot
 ```
 
-Reconnect, confirm Debian and available resources, then add 1 GiB of emergency swap:
+Reconnect and install the official AWS CLI v2 build rather than Debian's
+potentially stale `awscli` package. Copy the public key block published in the
+[AWS CLI installation guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+into `/tmp/aws-cli-public-key.asc`, then verify both the published fingerprint
+and the installer signature:
+
+```bash
+mkdir /tmp/aws-cli-install
+cd /tmp/aws-cli-install
+
+curl -fLo awscliv2.zip \
+  https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+curl -fLo awscliv2.sig \
+  https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip.sig
+
+gpg --import /tmp/aws-cli-public-key.asc
+AWS_CLI_FINGERPRINT=$(gpg --with-colons --fingerprint A6310ACC4672475C |
+  awk -F: '$1 == "fpr" { print $10; exit }')
+test "${AWS_CLI_FINGERPRINT}" = \
+  FB5DB77FD5C118B80511ADA8A6310ACC4672475C
+gpg --verify awscliv2.sig awscliv2.zip
+
+unzip awscliv2.zip
+sudo ./aws/install --bin-dir /usr/local/bin \
+  --install-dir /usr/local/aws-cli
+/usr/local/bin/aws --version
+```
+
+Stop if the fingerprint or signature does not match. The expected output must
+identify AWS CLI v2 and the `AWS CLI Team <aws-cli@amazon.com>` signing key.
+The signing-key warning about an untrusted certification path is expected; a
+bad signature is not.
+
+Confirm Debian and available resources, then add 1 GiB of emergency swap:
 
 ```bash
 cat /etc/debian_version
@@ -256,23 +289,290 @@ This avoids SMTP and external identity services, but all account creation and re
 
 ## Backups, Upgrades, and Operations
 
-- Create a private S3 bucket in the same AWS region, block all public access, and give Chatto credentials limited to listing and reading/writing/deleting one backup prefix.
-- Configure a bucket lifecycle that retains daily archives for 14 days and expires noncurrent versions.
-- Store the credentials and a randomly generated backup passphrase in `/etc/chatto/`, owned by `chatto`, mode `0600`. Keep a second copy of the passphrase and `chatto.toml` in an external password manager; neither is recoverable from the server if the disk is lost.
-- Install a daily systemd timer that:
-  1. Runs `chatto backup --encrypt --include-keys`.
-  2. Uses a UTC timestamped `.tar.gz.age` filename.
-  3. Uploads the completed archive with `aws s3 cp`.
-  4. Verifies it with `aws s3api head-object`.
-  5. Retains only the newest two local archives.
-  6. Fails visibly in systemd if creation or upload fails.
+Use standard Amazon S3, not a Lightsail object-storage bucket. All S3
+provisioning, upload, inspection, and download operations use AWS CLI v2.
+Chatto remains responsible for producing and restoring its own archive.
+
+### Provision the S3 Bucket
+
+Use two separate AWS identities:
+
+- Run one-time bucket provisioning from an operator workstation or AWS
+  CloudShell using an existing administrative identity. Never copy this
+  identity's credentials to the Lightsail instance.
+- Give the instance a dedicated `chatto-backup` IAM user whose permissions are
+  limited to the backup prefix. Lightsail does not provide the EC2
+  instance-profile workflow, so this user uses a rotatable access key stored on
+  the instance.
+
+Before provisioning, choose a globally unique bucket name and a prefix without
+leading or trailing slashes:
+
+```bash
+CHATTO_AWS_REGION=AWS_REGION
+CHATTO_S3_BUCKET=GLOBALLY_UNIQUE_BUCKET_NAME
+CHATTO_BACKUP_PREFIX=chatto/backups
+CHATTO_AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+  --query Account --output text)
+
+test -n "${CHATTO_AWS_ACCOUNT_ID}"
+```
+
+If the operator identity is not already an administrator, grant it a temporary
+inline policy containing the following actions on
+`arn:aws:s3:::GLOBALLY_UNIQUE_BUCKET_NAME`, then remove that policy after
+provisioning:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProvisionChattoBackupBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:GetBucketLocation",
+        "s3:GetBucketOwnershipControls",
+        "s3:PutBucketOwnershipControls",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:GetEncryptionConfiguration",
+        "s3:PutEncryptionConfiguration",
+        "s3:GetBucketVersioning",
+        "s3:PutBucketVersioning",
+        "s3:GetLifecycleConfiguration",
+        "s3:PutLifecycleConfiguration",
+        "s3:GetBucketPolicy",
+        "s3:GetBucketPolicyStatus",
+        "s3:PutBucketPolicy"
+      ],
+      "Resource": "arn:aws:s3:::GLOBALLY_UNIQUE_BUCKET_NAME"
+    }
+  ]
+}
+```
+
+Create the bucket in the same region as Lightsail. `us-east-1` is the only
+region for which `LocationConstraint` must be omitted:
+
+```bash
+if [ "${CHATTO_AWS_REGION}" = us-east-1 ]; then
+  aws s3api create-bucket \
+    --bucket "${CHATTO_S3_BUCKET}" \
+    --region "${CHATTO_AWS_REGION}" \
+    --object-ownership BucketOwnerEnforced
+else
+  aws s3api create-bucket \
+    --bucket "${CHATTO_S3_BUCKET}" \
+    --region "${CHATTO_AWS_REGION}" \
+    --create-bucket-configuration \
+      "LocationConstraint=${CHATTO_AWS_REGION}" \
+    --object-ownership BucketOwnerEnforced
+fi
+
+aws s3api put-public-access-block \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}" \
+  --public-access-block-configuration \
+    'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+
+aws s3api put-bucket-encryption \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}" \
+  --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":false}]}'
+
+aws s3api put-bucket-versioning \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}" \
+  --versioning-configuration Status=Enabled
+```
+
+Generate and install the lifecycle configuration. It retains current encrypted
+archives for 14 days, expires noncurrent versions after 14 days, and cleans up
+abandoned multipart uploads after one day:
+
+```bash
+jq -n --arg prefix "${CHATTO_BACKUP_PREFIX}/" '{
+  Rules: [{
+    ID: "chatto-backup-retention",
+    Status: "Enabled",
+    Filter: {Prefix: $prefix},
+    Expiration: {Days: 14},
+    NoncurrentVersionExpiration: {NoncurrentDays: 14},
+    AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+  }]
+}' > /tmp/chatto-s3-lifecycle.json
+
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}" \
+  --lifecycle-configuration file:///tmp/chatto-s3-lifecycle.json
+```
+
+Require TLS for every bucket request:
+
+```bash
+jq -n --arg bucket "${CHATTO_S3_BUCKET}" '{
+  Version: "2012-10-17",
+  Statement: [{
+    Sid: "DenyInsecureTransport",
+    Effect: "Deny",
+    Principal: "*",
+    Action: "s3:*",
+    Resource: [
+      ("arn:aws:s3:::" + $bucket),
+      ("arn:aws:s3:::" + $bucket + "/*")
+    ],
+    Condition: {Bool: {"aws:SecureTransport": "false"}}
+  }]
+}' > /tmp/chatto-s3-bucket-policy.json
+
+aws s3api put-bucket-policy \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}" \
+  --policy file:///tmp/chatto-s3-bucket-policy.json
+```
+
+S3 notes that the first versioning enablement can take up to 15 minutes to
+propagate. Wait 15 minutes before the first production upload.
+
+### Create the Runtime IAM User
+
+Have an IAM administrator create a user named `chatto-backup` with no console
+access. If this is delegated to the provisioning operator, temporarily grant
+that operator `iam:CreateUser`, `iam:GetUser`, `iam:GetLoginProfile`,
+`iam:PutUserPolicy`, `iam:GetUserPolicy`, `iam:ListUserPolicies`,
+`iam:ListAttachedUserPolicies`, `iam:CreateAccessKey`,
+`iam:ListAccessKeys`, `iam:UpdateAccessKey`, and `iam:DeleteAccessKey`, scoped to
+`arn:aws:iam::AWS_ACCOUNT_ID:user/chatto-backup`. Remove the delegation after
+the user and first key are configured.
+
+Replace the three placeholders below, attach the result to `chatto-backup` as
+an inline policy named `ChattoBackupPrefix`, and do not attach any AWS managed
+S3 policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InspectBucket",
+      "Effect": "Allow",
+      "Action": "s3:GetBucketLocation",
+      "Resource": "arn:aws:s3:::GLOBALLY_UNIQUE_BUCKET_NAME"
+    },
+    {
+      "Sid": "ListBackupPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::GLOBALLY_UNIQUE_BUCKET_NAME",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "BACKUP_PREFIX",
+            "BACKUP_PREFIX/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "UseBackupObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": "arn:aws:s3:::GLOBALLY_UNIQUE_BUCKET_NAME/BACKUP_PREFIX/*"
+    }
+  ]
+}
+```
+
+Create one access key for the `chatto-backup` user using the IAM console's
+"Application running outside AWS" use case. Record it directly in the external
+password manager; do not download or retain an unencrypted credentials CSV.
+Create protected AWS CLI configuration paths on the server:
+
+```bash
+sudo install -d -o chatto -g chatto -m 0700 /etc/chatto/aws
+
+sudo -u chatto env \
+  AWS_CONFIG_FILE=/etc/chatto/aws/config \
+  AWS_SHARED_CREDENTIALS_FILE=/etc/chatto/aws/credentials \
+  /usr/local/bin/aws configure --profile chatto-backup
+
+sudo chown chatto:chatto \
+  /etc/chatto/aws/config /etc/chatto/aws/credentials
+sudo chmod 0600 \
+  /etc/chatto/aws/config /etc/chatto/aws/credentials
+```
+
+Enter the access key ID, secret access key, the Lightsail region, and `json`
+when prompted. The prompt keeps the secret out of shell history. Store a
+randomly generated backup passphrase separately in `/etc/chatto/`, owned by
+`chatto`, mode `0600`. Keep a second copy of the passphrase and `chatto.toml`
+in the external password manager; neither is recoverable from the server if
+the disk is lost.
+
+### Automate and Verify Backups
+
+Install a daily systemd service and timer. Set these environment values in the
+service rather than embedding credentials in the unit:
+
+```ini
+Environment=AWS_CONFIG_FILE=/etc/chatto/aws/config
+Environment=AWS_SHARED_CREDENTIALS_FILE=/etc/chatto/aws/credentials
+Environment=AWS_PROFILE=chatto-backup
+Environment=AWS_REGION=AWS_REGION
+Environment=AWS_PAGER=
+```
+
+The backup program run by the service must:
+
+1. Run `chatto backup --encrypt --include-keys`.
+2. Name the completed archive with a UTC timestamp and `.tar.gz.age` suffix.
+3. Calculate its byte count and hexadecimal SHA-256 digest:
+
+   ```bash
+   BACKUP_SIZE=$(stat -c %s "${BACKUP_ARCHIVE}")
+   BACKUP_SHA256=$(sha256sum "${BACKUP_ARCHIVE}" | awk '{print $1}')
+   ```
+
+4. Upload it under `BACKUP_PREFIX/` with explicit encryption, an S3-managed
+   transfer checksum, and the full-file SHA-256 stored as object metadata:
+
+   ```bash
+   /usr/local/bin/aws s3 cp "${BACKUP_ARCHIVE}" \
+     "s3://${S3_BUCKET}/${BACKUP_OBJECT_KEY}" \
+     --region "${AWS_REGION}" \
+     --sse AES256 \
+     --checksum-algorithm SHA256 \
+     --metadata "sha256=${BACKUP_SHA256}" \
+     --only-show-errors
+   ```
+
+5. Run `aws s3api head-object --checksum-mode ENABLED` with
+   `--expected-bucket-owner` and fail unless `ContentLength` equals
+   `BACKUP_SIZE`, `Metadata.sha256` equals `BACKUP_SHA256`,
+   `ChecksumSHA256` is present, and `ServerSideEncryption` equals `AES256`.
+   The S3 checksum can be a composite checksum for multipart uploads, so it
+   must not be compared directly with the full-file digest.
+6. Retain only the newest two local archives, but delete an older local
+   archive only after its replacement has passed the remote verification.
+7. Exit nonzero on backup, upload, or verification failure so the failure is
+   visible in systemd and `journalctl`.
 
 Chatto explicitly recommends encrypted backups with included keys for small servers and remote object storage rather than the same disk. [Backup and restore guide](https://docs.chatto.run/guides/operations/backup-restore/)
 
 Do not auto-update a pre-1.0 server. For each upgrade:
 
 1. Read the release notes.
-2. Create and verify an off-site backup.
+2. Start the backup service and require a successful checksum-verified S3
+   upload before continuing.
 3. Download and checksum the new binary.
 4. Stop Chatto.
 5. Preserve the previous binary as `chatto.previous`.
@@ -280,7 +580,18 @@ Do not auto-update a pre-1.0 server. For each upgrade:
 7. Check readiness, login, logs, memory, and admin diagnostics.
 8. Restore the previous binary if startup or compatibility checks fail.
 
-Test disaster recovery on a temporary instance: download an encrypted archive, stop Chatto, restore with the passphrase, start it, and confirm the owner can log in and read messages and attachments.
+Test disaster recovery on a temporary instance. Use `aws s3api
+list-objects-v2` restricted to `BACKUP_PREFIX/` to select an archive, inspect it
+with `head-object --checksum-mode ENABLED`, and download it with `aws s3 cp`.
+Recompute the downloaded file's size and full-file SHA-256 and compare them
+with `ContentLength` and `Metadata.sha256` before decrypting it. Then stop
+Chatto, restore with the passphrase, start it, and confirm the owner can log in
+and read messages and attachments.
+
+Rotate the server access key without downtime: create a second access key,
+rerun `aws configure --profile chatto-backup`, run and verify a test backup,
+then deactivate the old key. Delete the old key only after another scheduled
+backup succeeds. Never keep two active keys longer than the rotation window.
 
 ## Verification and Acceptance Criteria
 
@@ -298,6 +609,90 @@ df -h /
 sudo journalctl -u chatto --since "15 minutes ago"
 ```
 
+Verify AWS CLI, the runtime identity, and every S3 control created during
+provisioning. Run the identity and object checks with the protected
+`chatto-backup` profile; run bucket-configuration checks with the operator
+identity because the runtime identity intentionally cannot read or change
+those settings:
+
+```bash
+/usr/local/bin/aws --version
+
+sudo -u chatto env \
+  AWS_CONFIG_FILE=/etc/chatto/aws/config \
+  AWS_SHARED_CREDENTIALS_FILE=/etc/chatto/aws/credentials \
+  AWS_PROFILE=chatto-backup \
+  AWS_PAGER= \
+  /usr/local/bin/aws sts get-caller-identity
+
+aws s3api get-bucket-location \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}"
+aws s3api get-bucket-ownership-controls \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}"
+aws s3api get-public-access-block \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}"
+aws s3api get-bucket-encryption \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}"
+aws s3api get-bucket-versioning \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}"
+aws s3api get-bucket-lifecycle-configuration \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}"
+aws s3api get-bucket-policy-status \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}"
+aws s3api get-bucket-policy \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}" \
+  --query Policy --output text
+
+aws iam get-user --user-name chatto-backup
+aws iam get-user-policy \
+  --user-name chatto-backup \
+  --policy-name ChattoBackupPrefix
+aws iam list-user-policies --user-name chatto-backup
+aws iam list-attached-user-policies --user-name chatto-backup
+aws iam list-access-keys --user-name chatto-backup
+
+# This must fail with NoSuchEntity, proving there is no console password.
+aws iam get-login-profile --user-name chatto-backup
+
+sudo systemctl is-enabled chatto-backup.timer
+sudo systemctl list-timers chatto-backup.timer --all
+sudo systemctl status chatto-backup.service --no-pager
+sudo journalctl -u chatto-backup.service --since "2 days ago"
+```
+
+The S3 results must show:
+
+- The bucket is in the Lightsail region. S3 reports `null` or `US` for
+  `us-east-1`.
+- Object ownership is `BucketOwnerEnforced`.
+- All four public-access-block settings are `true`, and bucket policy status
+  reports `IsPublic: false`. The decoded bucket policy contains the
+  `DenyInsecureTransport` statement.
+- Default encryption is `AES256`.
+- Versioning is `Enabled`.
+- The lifecycle rule applies only to `BACKUP_PREFIX/`, expires current and
+  noncurrent objects after 14 days, and aborts incomplete multipart uploads
+  after one day.
+- The IAM user has no console password, has only the `ChattoBackupPrefix`
+  inline policy, and normally has exactly one active access key.
+
+For the newest backup, use the runtime profile to run `list-objects-v2` with
+`--prefix "BACKUP_PREFIX/"` and `head-object --checksum-mode ENABLED`.
+Confirm that the returned key is below the expected prefix and that its
+`ContentLength`, `Metadata.sha256`, and `ServerSideEncryption` match the local
+archive and the backup service's recorded values. Also confirm that
+`ChecksumSHA256` is present; S3 can return a composite value for multipart
+uploads, so the disaster-recovery download is the end-to-end full-file digest
+test.
+
 Acceptance requires:
 
 - Public `https://CHAT_HOST` has a valid certificate and redirects HTTP to HTTPS.
@@ -306,7 +701,15 @@ Acceptance requires:
 - Direct registration, video uploads, calls, and search are unavailable.
 - Only TCP 22, 80, and 443 are publicly reachable; NATS and its monitor remain localhost-only.
 - A reboot brings Chatto back automatically with data intact.
-- A daily encrypted backup appears in S3 and can be restored on a disposable instance.
+- AWS CLI v2 is installed from a signature-verified official installer.
+- The `chatto-backup` credentials can list only `BACKUP_PREFIX`, read and write
+  its objects, and cannot change bucket configuration or access another
+  prefix.
+- No AWS key is present in shell history, systemd unit files, logs, or any
+  group/world-readable file.
+- A daily encrypted backup appears in S3 with matching size and SHA-256
+  checksum and `AES256` server-side encryption, and can be checksum-verified
+  and restored on a disposable instance.
 - No kernel OOM events occur.
 - Under normal use, Chatto RSS remains below roughly 350 MiB, at least 64 MiB remains available, swap is not continuously growing, and disk usage stays below 70%.
 
@@ -315,6 +718,10 @@ If those memory conditions fail, move unchanged data and configuration to the $7
 ## Interfaces and Assumptions
 
 - No Chatto source-code or public API changes are required.
-- New operational interfaces are the systemd service, local operator Unix socket, backup timer, and private S3 prefix.
-- Required deployment inputs are `CHAT_HOST`, `ACME_CONTACT_EMAIL`, `OWNER_LOGIN`, `OWNER_DISPLAY_NAME`, AWS region, S3 bucket/prefix, and restricted S3 credentials.
+- New operational interfaces are the systemd service, local operator Unix
+  socket, AWS CLI v2 profile, backup service/timer, and private S3 prefix.
+- Required deployment inputs are `CHAT_HOST`, `ACME_CONTACT_EMAIL`,
+  `OWNER_LOGIN`, `OWNER_DISPLAY_NAME`, `AWS_ACCOUNT_ID`, `AWS_REGION`,
+  `S3_BUCKET`, `BACKUP_PREFIX`, and the restricted `chatto-backup`
+  credentials.
 - The $5 figure covers the Lightsail instance only. The attached static IPv4 is free; S3 storage/requests and domain registration are separate charges.
