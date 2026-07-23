@@ -6,7 +6,9 @@
 set -euo pipefail
 
 COMPLETION_MARKER=/var/log/chatto-launch.complete
+PREPARE_BOOT_ID=/var/log/chatto-launch.boot-id
 rm -f "${COMPLETION_MARKER}"
+rm -f "${PREPARE_BOOT_ID}"
 
 exec > >(tee -a /var/log/chatto-launch.log |
   logger -t chatto-launch -s 2>/dev/console) 2>&1
@@ -105,6 +107,7 @@ install -d -o chatto -g chatto -m 0750 \
   /var/lib/chatto/data \
   /var/lib/chatto/certs
 
+cat /proc/sys/kernel/random/boot_id > "${PREPARE_BOOT_ID}"
 touch "${COMPLETION_MARKER}"
 echo "Chatto base-instance preparation completed successfully"
 echo "Still required manually: reboot for the kernel upgrade, then AWS CLI v2 install (runbook section 2)"

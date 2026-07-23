@@ -10,6 +10,7 @@ Type=oneshot
 User=chatto
 Group=chatto
 WorkingDirectory=/var/lib/chatto/backups
+EnvironmentFile=-/etc/chatto/chatto.env
 EnvironmentFile=/etc/chatto/backup.env
 Environment=AWS_CONFIG_FILE=/etc/chatto/aws/config
 Environment=AWS_SHARED_CREDENTIALS_FILE=/etc/chatto/aws/credentials

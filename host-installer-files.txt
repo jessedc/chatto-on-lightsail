@@ -1,0 +1,16 @@
+aws-cli-public-key.asc
+chatto-operator-lib.sh
+install-host.sh
+verify-deployment.sh
+chatto-lightsail-launch.sh
+chatto-lightsail-backup.sh
+chatto-lightsail-alert.sh
+chatto-lightsail-reboot-required.sh
+chatto.service
+chatto-backup.service
+chatto-backup.timer
+chatto-backup-alert@.service
+chatto-reboot-required.service
+chatto-reboot-required.timer
+chatto-auto-upgrades.conf
+chatto-unattended-upgrades.conf
