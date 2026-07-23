@@ -1,4 +1,8 @@
 #!/bin/bash
+# Covers the package, swap, service-account, and directory steps of runbook
+# section 2. It does NOT reboot (do that manually once after first boot to
+# apply the kernel upgrade) and does NOT install AWS CLI v2, whose
+# signature verification stays a manual runbook step.
 set -euo pipefail
 
 exec > >(tee -a /var/log/chatto-launch.log |
@@ -8,9 +12,13 @@ export DEBIAN_FRONTEND=noninteractive
 
 echo "Starting Chatto base-instance preparation"
 
-apt-get update
-apt-get full-upgrade -y
-apt-get install -y \
+# First boot races unattended-upgrades for the dpkg lock; wait instead of
+# dying under set -e, because user data never re-runs.
+APT_OPTS=(-o DPkg::Lock::Timeout=300)
+
+apt-get "${APT_OPTS[@]}" update
+apt-get "${APT_OPTS[@]}" full-upgrade -y
+apt-get "${APT_OPTS[@]}" install -y \
   ca-certificates \
   curl \
   jq \
@@ -19,7 +27,14 @@ apt-get install -y \
   unzip \
   gnupg
 
-# Create a 1 GiB emergency swap file.
+# Create a 1 GiB emergency swap file. Recreate it if a previous partial run
+# left one with the wrong size.
+if [ -f /swapfile ] &&
+  [ "$(stat -c %s /swapfile)" -ne $((1024 * 1024 * 1024)) ]; then
+  swapoff /swapfile 2>/dev/null || true
+  rm -f /swapfile
+fi
+
 if [ ! -f /swapfile ]; then
   fallocate -l 1G /swapfile
 fi
@@ -59,3 +74,4 @@ install -d -o chatto -g chatto -m 0750 \
 
 touch /var/log/chatto-launch.complete
 echo "Chatto base-instance preparation completed successfully"
+echo "Still required manually: reboot for the kernel upgrade, then AWS CLI v2 install (runbook section 2)"
