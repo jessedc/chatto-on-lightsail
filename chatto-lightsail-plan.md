@@ -18,6 +18,7 @@ the $7/1 GB bundle before production if any threshold fails.
   plan. Message search is unavailable in the pinned Chatto release.
 
 Record all deployment inputs before starting: `CHAT_HOST`,
+`LIGHTSAIL_INSTANCE_NAME`, `LIGHTSAIL_STATIC_IP`,
 `ACME_CONTACT_EMAIL`, `OWNER_LOGIN`, `OWNER_DISPLAY_NAME`,
 `CHATTO_VERSION=v0.4.14`, `CHATTO_AWS_ACCOUNT_ID`, `CHATTO_AWS_REGION`,
 `CHATTO_S3_BUCKET`, `CHATTO_BACKUP_PREFIX`, `CHATTO_SNS_TOPIC_ARN`, the
@@ -1335,7 +1336,8 @@ availability are explicitly outside this deployment.
   `chatto-operations` SNS topic, `tailscaled`, the bundled
   `tailscale-archive-keyring.gpg`, and the one-time
   `chatto-tailscale-authkey.env` input.
-- Required deployment inputs are `CHAT_HOST`, `ACME_CONTACT_EMAIL`,
+- Required deployment inputs are `CHAT_HOST`, `LIGHTSAIL_INSTANCE_NAME`,
+  `LIGHTSAIL_STATIC_IP`, `ACME_CONTACT_EMAIL`,
   `OWNER_LOGIN`, `OWNER_DISPLAY_NAME`, `CHATTO_VERSION=v0.4.14`,
   `CHATTO_AWS_ACCOUNT_ID`, `CHATTO_AWS_REGION`, `CHATTO_S3_BUCKET`,
   `CHATTO_BACKUP_PREFIX`, `CHATTO_SNS_TOPIC_ARN`, the alert email,

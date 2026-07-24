@@ -1,24 +1,57 @@
 # Chatto on Lightsail
 
-This repository installs a private, low-resource Chatto deployment on an
-existing Debian 13 Lightsail instance. The primary audience is the human
-operator responsible for the AWS account, DNS, credentials, recovery material,
-and production acceptance. The scripts automate repeatable mechanics and stop
-at human security boundaries.
+[Chatto](https://docs.chatto.run) is a self-hosted community chat server that
+runs as a single Go binary with embedded NATS/JetStream. This repository
+deploys a private, low-resource Chatto instance — pinned to the qualified
+`v0.4.14` release — onto a Debian 13 AWS Lightsail VM, with S3 backups, SNS
+alerts, SES transactional email, and administrative SSH over Tailscale.
 
-The deployment remains pinned to Chatto `v0.4.14`. The complete architecture,
-manual fallback, operational procedures, and acceptance rationale are in
-[`chatto-lightsail-plan.md`](chatto-lightsail-plan.md).
+The primary audience is the human operator responsible for the AWS account,
+DNS, credentials, recovery material, and production acceptance. The scripts
+automate repeatable mechanics and stop at human security boundaries. The
+complete architecture, manual fallback, operational procedures, and acceptance
+rationale are in [`chatto-lightsail-plan.md`](chatto-lightsail-plan.md).
 
 Throughout this README, **operator workstation** means your Mac. **Lightsail
 host**, **instance**, and **server** mean the remote Debian 13 VM.
 
+Resuming a paused deployment? Run `./check-deployment-progress.sh`: it is
+read-only, reports which workstation artifacts already exist, and names the
+next step.
+
+## Contents
+
+- Before installation
+  - [A. Install and verify the operator tools](#a-install-and-verify-the-operator-tools)
+  - [B. Authenticate the personal-account operator](#b-authenticate-the-personal-account-operator)
+  - [C. Create the Lightsail instance and record its values](#c-create-the-lightsail-instance-and-record-its-values)
+  - [D. Lock down both Lightsail firewalls for bootstrap](#d-lock-down-both-lightsail-firewalls-for-bootstrap)
+  - [E. Prepare Tailscale](#e-prepare-tailscale)
+  - [F. Complete the deployment input](#f-complete-the-deployment-input)
+  - [G. Store the human-generated secrets](#g-store-the-human-generated-secrets)
+- [Repository preflight](#repository-preflight)
+- [1. Provision AWS](#1-provision-aws)
+- [2. Transfer the host installer](#2-transfer-the-host-installer)
+- [3. Prepare and reboot the host](#3-prepare-and-reboot-the-host)
+- [4. Preserve recovery material and remove temporary secrets](#4-preserve-recovery-material-and-remove-temporary-secrets)
+- [5. Verify the deployment](#5-verify-the-deployment)
+- [6. If capacity fails, replace the instance with the $7 bundle](#6-if-capacity-fails-replace-the-instance-with-the-7-bundle)
+- [7. Qualify recovery before production](#7-qualify-recovery-before-production)
+- [8. Move SSH onto the tailnet](#8-move-ssh-onto-the-tailnet)
+- [Reruns and recovery](#reruns-and-recovery)
+
 ## Before installation
 
-Complete these steps in order. Run all workstation commands in Bash from the
-repository root.
+Complete these steps in order. Run all workstation commands from the
+repository root. Repository scripts select Bash through their own shebang and
+behave the same from any interactive shell; run the remaining multi-line
+command blocks in Bash, since they are written and tested for it.
 
-### 1. Install and verify the operator tools
+Plan for external waits: [section 1](#1-provision-aws) stops for SNS email
+confirmation, SES DKIM verification, and SES production-access approval, and
+the last of those can take AWS up to a business day to grant.
+
+### A. Install and verify the operator tools
 
 The operator workstation requires Bash, AWS CLI v2.32 or newer, Python 3,
 `jq`, ShellCheck, `curl`, `tar`, OpenSSH (`ssh` and `scp`), `dig`, and the
@@ -44,33 +77,14 @@ from the official AWS package:
 AWS publishes installer details and signature-verification instructions in its
 [AWS CLI v2 installation guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
 
-Run this gate after installation. Do not continue if a command is missing or
-if AWS CLI is older than v2.32:
+Run this gate after installation. Do not continue if it reports a missing
+tool or an AWS CLI older than v2.32:
 
 ```bash
-(
-  set -euo pipefail
-  for tool in \
-    bash aws python3 jq shellcheck curl tar ssh scp dig grep mktemp sed stat; do
-    command -v "${tool}" >/dev/null 2>&1 || {
-      echo "Missing required operator tool: ${tool}" >&2
-      exit 1
-    }
-  done
-
-  aws_version=$(aws --version 2>&1)
-  if [[ ! "${aws_version}" =~ ^aws-cli/2\.([0-9]+)\. ]] ||
-    ((BASH_REMATCH[1] < 32)); then
-    echo "AWS CLI v2.32 or newer is required; found: ${aws_version}" >&2
-    exit 1
-  fi
-  printf '%s\n' "${aws_version}"
-  jq --version
-  shellcheck --version
-)
+./check-operator-tools.sh
 ```
 
-### 2. Authenticate the personal-account operator
+### B. Authenticate the personal-account operator
 
 This deployment uses a dedicated `chatto-operator` IAM user in the personal
 AWS account. The operator must be allowed to create and configure S3, SNS,
@@ -122,13 +136,10 @@ account, an ARN containing `root`, or any other unexpected identity. Set
 `AWS_PROFILE=chatto-admin` again in each new workstation shell used for this
 deployment.
 
-### 3. Create and verify the Lightsail instance and DNS
+### C. Create the Lightsail instance and record its values
 
-Record the AWS account ID, Lightsail region, instance name, static IPv4
-address, chat hostname, and the operator's current public IP before continuing.
-Use the same region in every Lightsail and provisioning command.
-
-Print the workstation's current public IPv4 address with:
+Print the workstation's current public IPv4 address and note it for the
+firewall step:
 
 ```bash
 curl -4 -fsS https://checkip.amazonaws.com
@@ -136,42 +147,59 @@ curl -4 -fsS https://checkip.amazonaws.com
 
 In the Lightsail console:
 
-1. Select the deployment region.
+1. Select the deployment region, and use that same region in every later
+   Lightsail and provisioning command.
 2. Create a Linux/Unix instance using the **OS Only / Debian 13** blueprint.
 3. Select the $5 public-IPv4 bundle to evaluate the lowest-cost option, or
    start with the $7/1 GB bundle to avoid a snapshot-based replacement if the
    later capacity gate rejects the $5 bundle.
-4. Give the instance its recorded name and wait for it to reach `Running`.
+4. Name the instance and wait for it to reach `Running`.
 5. Create a Lightsail static IPv4 address in the same region and attach it to
    the instance.
 6. Create an `A` record for the chat hostname pointing to that static IPv4
    address.
 
-Replace all `REPLACE_WITH_...` values below, then verify the instance and DNS.
-The instance output must show `running`, the Debian 13 blueprint, the intended
-bundle, and the attached static IPv4 address. The DNS command must return that
-same static IPv4 address.
+Record the results in the deployment input file. Later steps read this file
+instead of asking for hand-copied placeholder values:
 
 ```bash
-aws lightsail get-instance \
-  --region REPLACE_WITH_REGION \
-  --instance-name REPLACE_WITH_INSTANCE_NAME \
-  --query \
-    'instance.{State:state.name,Blueprint:blueprintName,Bundle:bundleId,PublicIPv4:publicIpAddress}' \
-  --output table
+cp chatto-deploy.env.example chatto-deploy.env
+chmod 0600 chatto-deploy.env
+```
 
-aws lightsail get-static-ips \
-  --region REPLACE_WITH_REGION \
-  --output table
+Edit `chatto-deploy.env` and set at least `CHAT_HOST`,
+`LIGHTSAIL_INSTANCE_NAME`, `LIGHTSAIL_STATIC_IP`, and `CHATTO_AWS_REGION` to
+the values just created. Do not add shell quotes: values are read literally,
+without shell evaluation. [Step F](#f-complete-the-deployment-input) completes
+the remaining values.
 
-dig +short REPLACE_WITH_CHAT_HOST A
-dig +short REPLACE_WITH_CHAT_HOST AAAA
+Verify the instance and DNS using the recorded values. The instance output
+must show `running`, the Debian 13 blueprint, the intended bundle, and the
+attached static IPv4 address. The `A` lookup must return exactly the recorded
+static IPv4 address.
+
+```bash
+(
+  set -euo pipefail
+  region=$(./deployment-value.sh CHATTO_AWS_REGION)
+  instance=$(./deployment-value.sh LIGHTSAIL_INSTANCE_NAME)
+  chat_host=$(./deployment-value.sh CHAT_HOST)
+  aws lightsail get-instance \
+    --region "${region}" \
+    --instance-name "${instance}" \
+    --query \
+      'instance.{State:state.name,Blueprint:blueprintName,Bundle:bundleId,PublicIPv4:publicIpAddress}' \
+    --output table
+  aws lightsail get-static-ips --region "${region}" --output table
+  dig +short "${chat_host}" A
+  dig +short "${chat_host}" AAAA
+)
 ```
 
 The `AAAA` result must be empty unless IPv6 was deliberately enabled and the
 hostname was deliberately pointed at this instance's public IPv6 address.
 
-### 4. Lock down both Lightsail firewalls for bootstrap
+### D. Lock down both Lightsail firewalls for bootstrap
 
 In the instance's **Networking** tab, remove the default inbound rules and
 configure the IPv4 firewall with only:
@@ -189,20 +217,24 @@ changes before installation, update the TCP 22 rule before reconnecting.
 Inspect the effective rules from the workstation:
 
 ```bash
-aws lightsail get-instance-port-states \
-  --region REPLACE_WITH_REGION \
-  --instance-name REPLACE_WITH_INSTANCE_NAME \
-  --output json |
-  jq '.portStates | map({
-    protocol, fromPort, toPort, cidrs, ipv6Cidrs, cidrListAliases
-  })'
+(
+  set -euo pipefail
+  aws lightsail get-instance-port-states \
+    --region "$(./deployment-value.sh CHATTO_AWS_REGION)" \
+    --instance-name "$(./deployment-value.sh LIGHTSAIL_INSTANCE_NAME)" \
+    --output json |
+    jq '.portStates | map({
+      protocol, fromPort, toPort, cidrs, ipv6Cidrs, cidrListAliases
+    })'
+)
 ```
 
-Do not continue until the output matches the rules above. TCP 22 is temporary:
-administrative SSH moves onto the tailnet, and the final SSH-lockdown step
-removes public TCP 22 from both firewalls.
+Do not continue until the output matches the rules above. TCP 22 is
+temporary: administrative SSH moves onto the tailnet, and the final
+SSH-lockdown step ([section 8](#8-move-ssh-onto-the-tailnet)) removes public
+TCP 22 from both firewalls.
 
-### 5. Prepare Tailscale
+### E. Prepare Tailscale
 
 Use a Tailscale account whose workstation and other operator devices are
 already enrolled. Add `tag:chatto` to the tailnet policy file. `tagOwners`
@@ -232,43 +264,25 @@ silently. Tailscale SSH itself remains disabled.
 
 In the admin console, create an auth key with all of these properties:
 pre-authorized, **not** reusable, not ephemeral, and tagged `tag:chatto`. Save
-it without putting the key in shell history:
+it with the repository script, which prompts without echoing and keeps the key
+out of shell history:
 
 ```bash
-(
-  set -euo pipefail
-  umask 077
-  read -r -s -p 'Tailscale auth key: ' TS_AUTHKEY
-  printf '\n'
-  [[ "${TS_AUTHKEY}" == tskey-auth-* ]] || {
-    echo "The value does not look like a Tailscale auth key" >&2
-    exit 1
-  }
-  printf 'TS_AUTHKEY=%s\n' "${TS_AUTHKEY}" \
-    > chatto-tailscale-authkey.env
-)
-test -s chatto-tailscale-authkey.env
+./save-tailscale-authkey.sh
 ```
 
-### 6. Create the literal deployment input
+### F. Complete the deployment input
 
-Copy and edit the literal deployment input file:
-
-```bash
-cp chatto-deploy.env.example chatto-deploy.env
-chmod 0600 chatto-deploy.env
-```
-
-Do not add shell quotes. Values are read literally, without shell evaluation.
-Set `CHATTO_AWS_REGION` to the region containing the Lightsail instance, choose
-a globally unique S3 bucket name, and leave `CHATTO_AWS_ACCOUNT_ID` and
-`CHATTO_SNS_TOPIC_ARN` blank: provisioning fills those generated values.
-Set `CHATTO_SES_DOMAIN=jessedc.dev` and
-`CHATTO_SMTP_FROM=noreply@jessedc.dev`; the sender must be directly below the
-configured SES domain.
+Fill in the rest of the `chatto-deploy.env` file created in
+[step C](#c-create-the-lightsail-instance-and-record-its-values). Choose a
+globally unique S3 bucket name, set the owner and email addresses, and leave
+`CHATTO_AWS_ACCOUNT_ID` and `CHATTO_SNS_TOPIC_ARN` blank: provisioning fills
+those generated values. Keep `CHATTO_SES_DOMAIN` and `CHATTO_SMTP_FROM` as
+the example file records them for this deployment; the sender must be an
+address directly below the configured SES domain.
 
 Before continuing, inspect every line and make sure none of the example
-addresses or placeholder bucket name remains:
+addresses or placeholder values remains:
 
 ```bash
 if grep -nE 'example\.com|operator@example\.com|replace-with' \
@@ -280,7 +294,7 @@ else
 fi
 ```
 
-### 7. Store the human-generated secrets
+### G. Store the human-generated secrets
 
 Create and save a random backup passphrase of at least 24 characters and a
 strong owner password in the external password manager before running the host
@@ -298,10 +312,14 @@ copying artifacts:
   tests/operator-workflow-test.sh
   bash -n \
     chatto-operator-lib.sh provision-aws.sh install-host.sh \
-    verify-deployment.sh chatto-lightsail-*.sh
+    verify-deployment.sh check-operator-tools.sh \
+    check-deployment-progress.sh deployment-value.sh \
+    save-tailscale-authkey.sh chatto-lightsail-*.sh
   shellcheck -x \
     chatto-operator-lib.sh provision-aws.sh install-host.sh \
-    verify-deployment.sh chatto-lightsail-*.sh tests/*.sh
+    verify-deployment.sh check-operator-tools.sh \
+    check-deployment-progress.sh deployment-value.sh \
+    save-tailscale-authkey.sh chatto-lightsail-*.sh tests/*.sh
 )
 ```
 
@@ -335,47 +353,51 @@ writes:
   password, mode `0600`, once SES is ready.
 
 The first run normally stops while SNS confirmation and SES domain
-verification are pending. Confirm the SNS subscription. Add each CNAME printed
-under `Publish these CNAME records` to the DNS zone for `jessedc.dev`; do not
-alter the record names or targets. In the SES console for
-`CHATTO_AWS_REGION`, request production access so Chatto can send to recipients
-that are not separately verified SES identities.
+verification are pending; these waits are external, so expect this section to
+span more than one sitting. Confirm the SNS subscription from the email AWS
+sends (usually within minutes). Add each CNAME printed under
+`Publish these CNAME records` to the DNS zone for the configured
+`CHATTO_SES_DOMAIN`; do not alter the record names or targets. Easy DKIM
+usually reports `Verified` within an hour of DNS publication. In the SES
+console for `CHATTO_AWS_REGION`, request production access so Chatto can send
+to recipients that are not separately verified SES identities; that approval
+is human-reviewed and can take up to a business day.
 
 After SNS is confirmed, Easy DKIM reports `Verified`, and SES production
-access is approved, rerun without creating another backup access key:
-
-```bash
-./provision-aws.sh \
-  --env chatto-deploy.env \
-  --output chatto-provisioned.env \
-  --smtp-credentials-output chatto-smtp-credentials.env
-```
-
-If the first run already created the SMTP credential, omit
-`--smtp-credentials-output` on the rerun. The script never overwrites a
-credential output, and AWS cannot recover either access-key secret. Store both
-credential files in the password manager.
+access is approved, rerun the same command. Reruns are safe: the script
+reports and keeps any credential it already captured, never overwrites a
+credential output, and AWS cannot recover either access-key secret. Store
+both credential files in the password manager.
 
 ## 2. Transfer the host installer
 
-Build a fixed-manifest archive containing only host-side artifacts:
+**On the workstation**, build a fixed-manifest archive containing only
+host-side artifacts, then copy it and the deployment inputs to the recorded
+static IP and connect:
 
 ```bash
-tar -czf /tmp/chatto-host-installer.tgz -T host-installer-files.txt
+(
+  set -euo pipefail
+  tar -czf /tmp/chatto-host-installer.tgz -T host-installer-files.txt
+  lightsail_ip=$(./deployment-value.sh LIGHTSAIL_STATIC_IP)
+  scp \
+    /tmp/chatto-host-installer.tgz \
+    chatto-provisioned.env \
+    chatto-access-key.env \
+    chatto-smtp-credentials.env \
+    chatto-tailscale-authkey.env \
+    "admin@${lightsail_ip}:"
+  ssh "admin@${lightsail_ip}"
+)
 ```
 
-Replace `LIGHTSAIL_IP` below with the instance's static IP:
+The Debian Lightsail image normally uses `admin` as its SSH user. Use the
+actual blueprint user if it differs.
+
+**On the Lightsail host**, in the SSH session the last command opened, unpack
+the installer:
 
 ```bash
-scp \
-  /tmp/chatto-host-installer.tgz \
-  chatto-provisioned.env \
-  chatto-access-key.env \
-  chatto-smtp-credentials.env \
-  chatto-tailscale-authkey.env \
-  admin@LIGHTSAIL_IP:
-
-ssh admin@LIGHTSAIL_IP
 mkdir -p chatto-on-lightsail
 tar -xzf chatto-host-installer.tgz -C chatto-on-lightsail
 mv chatto-provisioned.env chatto-access-key.env \
@@ -385,10 +407,9 @@ cd chatto-on-lightsail
 chmod +x install-host.sh verify-deployment.sh
 ```
 
-The Debian Lightsail image normally uses `admin` as its SSH user. Use the
-actual blueprint user if it differs.
-
 ## 3. Prepare and reboot the host
+
+**On the Lightsail host**, still in that SSH session:
 
 ```bash
 sudo ./install-host.sh prepare
@@ -399,7 +420,13 @@ The prepare phase is idempotent. It configures the 1 GiB swap file, installs
 base packages, upgrades Debian, and creates the locked-down `chatto` service
 account. It deliberately does not hide the required reboot.
 
-Reconnect after the instance returns:
+**On the workstation**, reconnect after the instance returns:
+
+```bash
+ssh "admin@$(./deployment-value.sh LIGHTSAIL_STATIC_IP)"
+```
+
+**On the Lightsail host**, run the install phase:
 
 ```bash
 cd chatto-on-lightsail
@@ -436,7 +463,7 @@ secret Chatto configuration directly into a mode-`0600` recovery archive:
 
 ```bash
 umask 077
-ssh admin@LIGHTSAIL_IP \
+ssh "admin@$(./deployment-value.sh LIGHTSAIL_STATIC_IP)" \
   'sudo tar -C /etc/chatto -czf - chatto.toml chatto.env smtp.env' \
   > chatto-recovery-config.tgz
 chmod 0600 chatto-recovery-config.tgz
@@ -476,7 +503,7 @@ minted key.
 
 ## 5. Verify the deployment
 
-Run the live backup and alert paths:
+**On the Lightsail host**, run the live backup and alert paths:
 
 ```bash
 sudo ./verify-deployment.sh --run-backup --send-alert
@@ -484,7 +511,8 @@ sudo ./verify-deployment.sh --run-backup --send-alert
 
 Confirm the SNS test alert arrives. Log in as the owner, add an email address
 from account settings, and confirm that the Chatto verification message
-arrives from `noreply@jessedc.dev`. Complete the code challenge, then exercise
+arrives from the configured `CHATTO_SMTP_FROM` sender. Complete the code
+challenge, then exercise
 password recovery and confirm the received message passes DKIM. Public
 registration must remain unavailable.
 
@@ -510,9 +538,10 @@ workload and run the 15-minute capacity gate:
 sudo ./verify-deployment.sh --capacity
 ```
 
-If every threshold passes, continue to the recovery qualification. If any
-threshold fails, do not accept the host for production; follow the replacement
-procedure below.
+If every threshold passes, continue to the recovery qualification
+([section 7](#7-qualify-recovery-before-production)). If any threshold fails,
+do not accept the host for production; follow the replacement procedure in
+[section 6](#6-if-capacity-fails-replace-the-instance-with-the-7-bundle).
 
 ## 6. If capacity fails, replace the instance with the $7 bundle
 
@@ -579,18 +608,33 @@ acceptance.
 ## 8. Move SSH onto the tailnet
 
 Only after the production host verification and disposable qualification pass,
-open a **new** terminal on the workstation while keeping the existing
-public-IP session connected, and confirm SSH over the tailnet:
+keep the existing public-IP session connected and read the host's tailnet
+IPv4 address from the `Tailnet address` line that `verify-deployment.sh`
+printed (or run `tailscale ip -4` on the host).
+
+Test with that literal `100.x.y.z` address, not a name. A `Host chatto` alias
+in the workstation's `~/.ssh/config` — or any entry pointing at the public
+hostname or IP — shadows the MagicDNS name `chatto`, so `ssh admin@chatto`
+can silently connect over the public path, appear to prove tailnet access,
+and then lock the operator out when public TCP 22 closes. The literal address
+cannot ride the wrong path.
+
+**On the workstation**, open a **new** terminal and confirm SSH over the
+tailnet, replacing `TAILNET_IPV4` with the address read above:
 
 ```bash
-ssh admin@chatto
+ssh admin@TAILNET_IPV4
 ```
 
-Use `ssh admin@TAILNET_IP` with the address printed by the verification if
-MagicDNS is disabled. Once that session works, remove TCP 22 from **both** the
-IPv4 and the IPv6 Lightsail firewalls, confirm `ssh admin@LIGHTSAIL_IP` now
-times out, and test break-glass access once. Runbook section 7 has the full
-procedure, the exact firewall command, failure modes, and rollback.
+Once that session works, remove TCP 22 from **both** the IPv4 and the IPv6
+Lightsail firewalls, confirm that a public-IP connection
+(`ssh "admin@$(./deployment-value.sh LIGHTSAIL_STATIC_IP)"`) now times out,
+and test break-glass access once. Afterward, the MagicDNS name is fine for daily use —
+first run `ssh -G chatto` and confirm its `hostname` line shows the tailnet
+address rather than an alias target. Runbook
+[section 7](chatto-lightsail-plan.md#7-private-administrative-access-over-tailscale)
+has the full procedure, the exact firewall command, failure modes, and
+rollback.
 
 ## Reruns and recovery
 
@@ -605,6 +649,9 @@ procedure, the exact firewall command, failure modes, and rollback.
   (break-glass), then repair Tailscale over plain SSH.
 - `provision-aws.sh` reconciles resource controls but refuses unexpected IAM
   policies, console access, extra keys, or a mismatched AWS account.
+- `provision-aws.sh` reruns keep already-captured credential outputs
+  unchanged; it stops only when an access key exists without its captured
+  file, because AWS cannot recover the secret.
 - Neither installer upgrades or downgrades an existing different Chatto
   version. Use the runbook's verified backup and manual upgrade procedure.
 - A true recovery also needs the password-manager copies of

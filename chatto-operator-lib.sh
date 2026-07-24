@@ -32,6 +32,8 @@ require_value() {
 deployment_variable_names() {
   printf '%s\n' \
     CHAT_HOST \
+    LIGHTSAIL_INSTANCE_NAME \
+    LIGHTSAIL_STATIC_IP \
     ACME_CONTACT_EMAIL \
     OWNER_LOGIN \
     OWNER_DISPLAY_NAME \
@@ -49,7 +51,8 @@ deployment_variable_names() {
 
 is_deployment_variable() {
   case "$1" in
-    CHAT_HOST | ACME_CONTACT_EMAIL | OWNER_LOGIN | OWNER_DISPLAY_NAME | \
+    CHAT_HOST | LIGHTSAIL_INSTANCE_NAME | LIGHTSAIL_STATIC_IP | \
+      ACME_CONTACT_EMAIL | OWNER_LOGIN | OWNER_DISPLAY_NAME | \
       CHATTO_VERSION | CHATTO_AWS_ACCOUNT_ID | CHATTO_AWS_REGION | \
       CHATTO_S3_BUCKET | CHATTO_BACKUP_PREFIX | CHATTO_SNS_TOPIC_ARN | \
       CHATTO_ALERT_EMAIL | CHATTO_SES_DOMAIN | CHATTO_SMTP_FROM | \
@@ -138,6 +141,20 @@ validate_chat_host() {
       [[ "${label}" != -* && "${label}" != *- ]] ||
       operator_die "CHAT_HOST contains an invalid DNS label"
   done
+}
+
+validate_lightsail_identifiers() {
+  local octet='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+
+  require_value LIGHTSAIL_INSTANCE_NAME
+  require_value LIGHTSAIL_STATIC_IP
+  [ "${#LIGHTSAIL_INSTANCE_NAME}" -ge 2 ] &&
+    [ "${#LIGHTSAIL_INSTANCE_NAME}" -le 255 ] &&
+    [[ "${LIGHTSAIL_INSTANCE_NAME}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] ||
+    operator_die \
+      "LIGHTSAIL_INSTANCE_NAME must be 2-255 characters, start and end with a letter or digit, and use only letters, digits, dot, underscore, and hyphen"
+  [[ "${LIGHTSAIL_STATIC_IP}" =~ ^${octet}\.${octet}\.${octet}\.${octet}$ ]] ||
+    operator_die "LIGHTSAIL_STATIC_IP must be a dotted-quad IPv4 address"
 }
 
 validate_aws_identifiers() {
@@ -240,6 +257,7 @@ validate_base_deployment_env() {
   [ "${CHATTO_VERSION}" = v0.4.14 ] ||
     operator_die "CHATTO_VERSION must remain pinned to the qualified v0.4.14 release"
   validate_tailscale_hostname
+  validate_lightsail_identifiers
   validate_aws_identifiers
   validate_ses_configuration
 }

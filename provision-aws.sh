@@ -41,6 +41,11 @@ host installation succeeds.
 key, derives its SMTP password, and writes both to a new mode-0600 file. The
 AWS secret access key is not retained. Publish the reported DKIM records and
 obtain SES production access before this credential can be created.
+
+Reruns may repeat the same flags: a credential whose key and captured output
+file both already exist is reported and left unchanged. A key that exists
+without its captured file stops the run, because AWS cannot recover the
+secret.
 EOF
 }
 
@@ -488,33 +493,40 @@ active_key_count=$(jq -r \
 if [ -n "${ACCESS_KEY_OUTPUT}" ]; then
   access_key_output_dir=$(dirname "${ACCESS_KEY_OUTPUT}")
   if [ "${access_key_count}" -ne 0 ]; then
-    operator_die \
-      "an access key already exists; AWS cannot recover its secret, so omit --access-key-output"
-  fi
-  [ ! -e "${ACCESS_KEY_OUTPUT}" ] && [ ! -L "${ACCESS_KEY_OUTPUT}" ] ||
-    operator_die "refusing to overwrite credential file: ${ACCESS_KEY_OUTPUT}"
-  [ -d "${access_key_output_dir}" ] &&
-    [ -w "${access_key_output_dir}" ] ||
-    operator_die \
-      "access-key output directory is not writable: ${access_key_output_dir}"
-  ACCESS_KEY_TEMP=$(mktemp \
-    "${access_key_output_dir}/.chatto-access-key.XXXXXX")
-  chmod 0600 "${ACCESS_KEY_TEMP}"
+    # A rerun with the same flags is valid while the earlier capture exists;
+    # only a key whose captured secret is gone is unrecoverable.
+    [ -f "${ACCESS_KEY_OUTPUT}" ] && [ ! -L "${ACCESS_KEY_OUTPUT}" ] &&
+      [ -s "${ACCESS_KEY_OUTPUT}" ] ||
+      operator_die \
+        "an access key already exists but ${ACCESS_KEY_OUTPUT} was not captured; AWS cannot recover the secret, so delete the chatto-backup access key and rerun, or restore the captured file"
+    operator_log \
+      "Runtime access key already provisioned; keeping ${ACCESS_KEY_OUTPUT} unchanged"
+  else
+    [ ! -e "${ACCESS_KEY_OUTPUT}" ] && [ ! -L "${ACCESS_KEY_OUTPUT}" ] ||
+      operator_die "refusing to overwrite credential file: ${ACCESS_KEY_OUTPUT}"
+    [ -d "${access_key_output_dir}" ] &&
+      [ -w "${access_key_output_dir}" ] ||
+      operator_die \
+        "access-key output directory is not writable: ${access_key_output_dir}"
+    ACCESS_KEY_TEMP=$(mktemp \
+      "${access_key_output_dir}/.chatto-access-key.XXXXXX")
+    chmod 0600 "${ACCESS_KEY_TEMP}"
 
-  operator_log "Creating the runtime access key in ${ACCESS_KEY_OUTPUT}"
-  access_key_json=$("${AWS_BIN}" iam create-access-key \
-    --user-name chatto-backup --output json)
-  access_key_id=$(jq -er '.AccessKey.AccessKeyId' <<<"${access_key_json}")
-  secret_access_key=$(jq -er '.AccessKey.SecretAccessKey' <<<"${access_key_json}")
-  umask 077
-  {
-    printf 'AWS_ACCESS_KEY_ID=%s\n' "${access_key_id}"
-    printf 'AWS_SECRET_ACCESS_KEY=%s\n' "${secret_access_key}"
-  } > "${ACCESS_KEY_TEMP}"
-  mv -- "${ACCESS_KEY_TEMP}" "${ACCESS_KEY_OUTPUT}"
-  ACCESS_KEY_TEMP=
-  unset secret_access_key access_key_json
-  access_key_count=1
+    operator_log "Creating the runtime access key in ${ACCESS_KEY_OUTPUT}"
+    access_key_json=$("${AWS_BIN}" iam create-access-key \
+      --user-name chatto-backup --output json)
+    access_key_id=$(jq -er '.AccessKey.AccessKeyId' <<<"${access_key_json}")
+    secret_access_key=$(jq -er '.AccessKey.SecretAccessKey' <<<"${access_key_json}")
+    umask 077
+    {
+      printf 'AWS_ACCESS_KEY_ID=%s\n' "${access_key_id}"
+      printf 'AWS_SECRET_ACCESS_KEY=%s\n' "${secret_access_key}"
+    } > "${ACCESS_KEY_TEMP}"
+    mv -- "${ACCESS_KEY_TEMP}" "${ACCESS_KEY_OUTPUT}"
+    ACCESS_KEY_TEMP=
+    unset secret_access_key access_key_json
+    access_key_count=1
+  fi
 fi
 
 operator_log "Provisioning restricted IAM user chatto-smtp"
@@ -605,47 +617,55 @@ if [ -n "${SMTP_CREDENTIALS_OUTPUT}" ] &&
   [ "${SES_PRODUCTION_READY}" = true ]; then
   smtp_credentials_output_dir=$(dirname "${SMTP_CREDENTIALS_OUTPUT}")
   if [ "${smtp_access_key_count}" -ne 0 ]; then
-    operator_die \
-      "an SMTP access key already exists; AWS cannot recover its secret, so omit --smtp-credentials-output"
-  fi
-  [ ! -e "${SMTP_CREDENTIALS_OUTPUT}" ] &&
-    [ ! -L "${SMTP_CREDENTIALS_OUTPUT}" ] ||
-    operator_die \
-      "refusing to overwrite SMTP credential file: ${SMTP_CREDENTIALS_OUTPUT}"
-  [ -d "${smtp_credentials_output_dir}" ] &&
-    [ -w "${smtp_credentials_output_dir}" ] ||
-    operator_die \
-      "SMTP credential output directory is not writable: ${smtp_credentials_output_dir}"
-  SMTP_CREDENTIALS_TEMP=$(mktemp \
-    "${smtp_credentials_output_dir}/.chatto-smtp-credentials.XXXXXX")
-  chmod 0600 "${SMTP_CREDENTIALS_TEMP}"
+    # A rerun with the same flags is valid while the earlier capture exists;
+    # only a key whose captured secret is gone is unrecoverable.
+    [ -f "${SMTP_CREDENTIALS_OUTPUT}" ] &&
+      [ ! -L "${SMTP_CREDENTIALS_OUTPUT}" ] &&
+      [ -s "${SMTP_CREDENTIALS_OUTPUT}" ] ||
+      operator_die \
+        "an SMTP access key already exists but ${SMTP_CREDENTIALS_OUTPUT} was not captured; AWS cannot recover the secret, so delete the chatto-smtp access key and rerun, or restore the captured file"
+    operator_log \
+      "SMTP credential already provisioned; keeping ${SMTP_CREDENTIALS_OUTPUT} unchanged"
+  else
+    [ ! -e "${SMTP_CREDENTIALS_OUTPUT}" ] &&
+      [ ! -L "${SMTP_CREDENTIALS_OUTPUT}" ] ||
+      operator_die \
+        "refusing to overwrite SMTP credential file: ${SMTP_CREDENTIALS_OUTPUT}"
+    [ -d "${smtp_credentials_output_dir}" ] &&
+      [ -w "${smtp_credentials_output_dir}" ] ||
+      operator_die \
+        "SMTP credential output directory is not writable: ${smtp_credentials_output_dir}"
+    SMTP_CREDENTIALS_TEMP=$(mktemp \
+      "${smtp_credentials_output_dir}/.chatto-smtp-credentials.XXXXXX")
+    chmod 0600 "${SMTP_CREDENTIALS_TEMP}"
 
-  operator_log \
-    "Creating the regional SMTP credential in ${SMTP_CREDENTIALS_OUTPUT}"
-  smtp_access_key_json=$("${AWS_BIN}" iam create-access-key \
-    --user-name chatto-smtp --output json)
-  smtp_username=$(jq -er \
-    '.AccessKey.AccessKeyId' <<<"${smtp_access_key_json}")
-  SMTP_ACCESS_KEY_ID_TEMP=${smtp_username}
-  smtp_secret_access_key=$(jq -er \
-    '.AccessKey.SecretAccessKey' <<<"${smtp_access_key_json}")
-  smtp_password=$(generate_ses_smtp_password \
-    "${smtp_secret_access_key}" "${CHATTO_AWS_REGION}")
-  [[ "${smtp_username}" =~ ^A[A-Z0-9]{19}$ ]] ||
-    operator_die "created SMTP access key ID has an unexpected format"
-  [ "${#smtp_password}" -eq 44 ] &&
-    [[ "${smtp_password}" =~ ^[A-Za-z0-9+/]+$ ]] ||
-    operator_die "derived SES SMTP password has an unexpected format"
-  umask 077
-  {
-    printf 'CHATTO_SMTP_USERNAME=%s\n' "${smtp_username}"
-    printf 'CHATTO_SMTP_PASSWORD=%s\n' "${smtp_password}"
-  } > "${SMTP_CREDENTIALS_TEMP}"
-  mv -- "${SMTP_CREDENTIALS_TEMP}" "${SMTP_CREDENTIALS_OUTPUT}"
-  SMTP_CREDENTIALS_TEMP=
-  SMTP_ACCESS_KEY_ID_TEMP=
-  unset smtp_secret_access_key smtp_password smtp_access_key_json
-  smtp_access_key_count=1
+    operator_log \
+      "Creating the regional SMTP credential in ${SMTP_CREDENTIALS_OUTPUT}"
+    smtp_access_key_json=$("${AWS_BIN}" iam create-access-key \
+      --user-name chatto-smtp --output json)
+    smtp_username=$(jq -er \
+      '.AccessKey.AccessKeyId' <<<"${smtp_access_key_json}")
+    SMTP_ACCESS_KEY_ID_TEMP=${smtp_username}
+    smtp_secret_access_key=$(jq -er \
+      '.AccessKey.SecretAccessKey' <<<"${smtp_access_key_json}")
+    smtp_password=$(generate_ses_smtp_password \
+      "${smtp_secret_access_key}" "${CHATTO_AWS_REGION}")
+    [[ "${smtp_username}" =~ ^A[A-Z0-9]{19}$ ]] ||
+      operator_die "created SMTP access key ID has an unexpected format"
+    [ "${#smtp_password}" -eq 44 ] &&
+      [[ "${smtp_password}" =~ ^[A-Za-z0-9+/]+$ ]] ||
+      operator_die "derived SES SMTP password has an unexpected format"
+    umask 077
+    {
+      printf 'CHATTO_SMTP_USERNAME=%s\n' "${smtp_username}"
+      printf 'CHATTO_SMTP_PASSWORD=%s\n' "${smtp_password}"
+    } > "${SMTP_CREDENTIALS_TEMP}"
+    mv -- "${SMTP_CREDENTIALS_TEMP}" "${SMTP_CREDENTIALS_OUTPUT}"
+    SMTP_CREDENTIALS_TEMP=
+    SMTP_ACCESS_KEY_ID_TEMP=
+    unset smtp_secret_access_key smtp_password smtp_access_key_json
+    smtp_access_key_count=1
+  fi
 fi
 
 output_dir=$(dirname "${OUTPUT_FILE}")
@@ -698,7 +718,7 @@ if ! jq -e --arg email "${CHATTO_ALERT_EMAIL}" '
     .SubscriptionArn != "PendingConfirmation"
   )' <<<"${subscriptions_json}" >/dev/null; then
   operator_die \
-    "confirm the SNS subscription sent to ${CHATTO_ALERT_EMAIL}, then rerun this command without --access-key-output"
+    "confirm the SNS subscription sent to ${CHATTO_ALERT_EMAIL}, then rerun this command"
 fi
 
 operator_log "AWS provisioning and verification completed successfully"

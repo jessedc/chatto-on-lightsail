@@ -23,6 +23,8 @@ SMTP_ENV="${TEST_TEMP_DIR}/smtp-credentials.env"
 
 cat > "${INPUT_ENV}" <<'EOF'
 CHAT_HOST=chat.example.com
+LIGHTSAIL_INSTANCE_NAME=chatto-test-instance
+LIGHTSAIL_STATIC_IP=203.0.113.10
 ACME_CONTACT_EMAIL=operator@example.com
 OWNER_LOGIN=chatadmin
 OWNER_DISPLAY_NAME=Chatto Owner
@@ -82,18 +84,35 @@ fi
   fail "SMTP credential output mode is ${smtp_mode}, expected 600"
 
 smtp_snapshot="${TEST_TEMP_DIR}/smtp-credentials.snapshot"
+access_snapshot="${TEST_TEMP_DIR}/access-key.snapshot"
 cp "${SMTP_ENV}" "${smtp_snapshot}"
+cp "${ACCESS_ENV}" "${access_snapshot}"
+MOCK_ACCESS_KEY_EXISTS=1 \
+  MOCK_SMTP_ACCESS_KEY_EXISTS=1 \
+  AWS_BIN="${REPOSITORY_DIR}/tests/mock-aws.sh" \
+  "${REPOSITORY_DIR}/provision-aws.sh" \
+  --env "${OUTPUT_ENV}" \
+  --output "${OUTPUT_ENV}" \
+  --access-key-output "${ACCESS_ENV}" \
+  --smtp-credentials-output "${SMTP_ENV}" >/dev/null ||
+  fail "a rerun with already-captured credential outputs failed"
+cmp -s "${SMTP_ENV}" "${smtp_snapshot}" ||
+  fail "the rerun changed the existing SMTP credential output"
+cmp -s "${ACCESS_ENV}" "${access_snapshot}" ||
+  fail "the rerun changed the existing access-key output"
+
+uncaptured_smtp="${TEST_TEMP_DIR}/uncaptured-smtp.env"
 if MOCK_ACCESS_KEY_EXISTS=1 \
   MOCK_SMTP_ACCESS_KEY_EXISTS=1 \
   AWS_BIN="${REPOSITORY_DIR}/tests/mock-aws.sh" \
   "${REPOSITORY_DIR}/provision-aws.sh" \
   --env "${OUTPUT_ENV}" \
   --output "${OUTPUT_ENV}" \
-  --smtp-credentials-output "${SMTP_ENV}" >/dev/null 2>&1; then
-  fail "an existing SMTP credential output was overwritten"
+  --smtp-credentials-output "${uncaptured_smtp}" >/dev/null 2>&1; then
+  fail "an existing SMTP key without its captured file was accepted"
 fi
-cmp -s "${SMTP_ENV}" "${smtp_snapshot}" ||
-  fail "failed SMTP credential rerun changed the existing output"
+[ ! -e "${uncaptured_smtp}" ] ||
+  fail "the uncaptured-key failure still wrote an SMTP credential file"
 
 MOCK_ACCESS_KEY_EXISTS=1 \
   MOCK_SMTP_ACCESS_KEY_EXISTS=1 \
