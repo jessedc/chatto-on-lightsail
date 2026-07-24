@@ -361,10 +361,13 @@ sends (usually within minutes). Add each CNAME printed under
 usually reports `Verified` within an hour of DNS publication. In the SES
 console for `CHATTO_AWS_REGION`, request production access so Chatto can send
 to recipients that are not separately verified SES identities; that approval
-is human-reviewed and can take up to a business day.
+is human-reviewed and can take up to a business day. Production access is not
+required to create the SMTP credential: the script warns while the account is
+still in the sandbox, where SES only delivers to separately verified
+identities, and the same credential works unchanged once approval lands.
 
-After SNS is confirmed, Easy DKIM reports `Verified`, and SES production
-access is approved, rerun the same command. Reruns are safe: the script
+After SNS is confirmed and Easy DKIM reports `Verified`, rerun the same
+command; production access can still be pending. Reruns are safe: the script
 reports and keeps any credential it already captured, never overwrites a
 credential output, and AWS cannot recover either access-key secret. Store
 both credential files in the password manager.
@@ -386,8 +389,8 @@ static IP and connect:
     chatto-access-key.env \
     chatto-smtp-credentials.env \
     chatto-tailscale-authkey.env \
-    "admin@${lightsail_ip}:"
-  ssh "admin@${lightsail_ip}"
+    chatto:
+  ssh chatto
 )
 ```
 

@@ -40,7 +40,8 @@ host installation succeeds.
 --smtp-credentials-output creates the regional SES SMTP user's first access
 key, derives its SMTP password, and writes both to a new mode-0600 file. The
 AWS secret access key is not retained. Publish the reported DKIM records and
-obtain SES production access before this credential can be created.
+wait for verification before this credential can be created; SES production
+access is reported but not required.
 
 Reruns may repeat the same flags: a credential whose key and captured output
 file both already exist is reported and left unchanged. A key that exists
@@ -613,8 +614,7 @@ smtp_active_key_count=$(jq -r \
   operator_die "chatto-smtp has an inactive access key; delete it first"
 
 if [ -n "${SMTP_CREDENTIALS_OUTPUT}" ] &&
-  [ "${SES_IDENTITY_READY}" = true ] &&
-  [ "${SES_PRODUCTION_READY}" = true ]; then
+  [ "${SES_IDENTITY_READY}" = true ]; then
   smtp_credentials_output_dir=$(dirname "${SMTP_CREDENTIALS_OUTPUT}")
   if [ "${smtp_access_key_count}" -ne 0 ]; then
     # A rerun with the same flags is valid while the earlier capture exists;
@@ -697,8 +697,8 @@ if [ "${SES_IDENTITY_READY}" != true ]; then
 fi
 
 if [ "${SES_PRODUCTION_READY}" != true ]; then
-  operator_die \
-    "SES production sending is not enabled in ${CHATTO_AWS_REGION}; request production access in SES and rerun this command"
+  operator_warn \
+    "SES production sending is not enabled in ${CHATTO_AWS_REGION}; the sandbox only delivers to separately verified SES identities until production access is approved"
 fi
 
 if [ "${smtp_access_key_count}" -eq 0 ]; then

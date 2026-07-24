@@ -703,8 +703,10 @@ Use SES in `CHATTO_AWS_REGION`; SNS remains an operational-alert channel and
 is not Chatto's mail transport. Create the `jessedc.dev` domain identity with
 Easy DKIM, publish all three returned CNAME records at the existing DNS
 provider, and wait for both `VerifiedForSendingStatus=true` and DKIM
-`Status=SUCCESS`. Request SES production access in the same region and require
-`SendingEnabled=true` and `ProductionAccessEnabled=true` before installation.
+`Status=SUCCESS`. Request SES production access in the same region; approval
+is not required for provisioning or installation, but until
+`ProductionAccessEnabled=true` the sandbox only delivers to separately
+verified SES identities.
 
 Create a separate `chatto-smtp` IAM user with no console access, no managed
 policies, and one inline policy named `ChattoSESSend`:
