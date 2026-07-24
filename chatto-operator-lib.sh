@@ -42,6 +42,8 @@ deployment_variable_names() {
     CHATTO_BACKUP_PREFIX \
     CHATTO_SNS_TOPIC_ARN \
     CHATTO_ALERT_EMAIL \
+    CHATTO_SES_DOMAIN \
+    CHATTO_SMTP_FROM \
     TAILSCALE_HOSTNAME
 }
 
@@ -50,7 +52,8 @@ is_deployment_variable() {
     CHAT_HOST | ACME_CONTACT_EMAIL | OWNER_LOGIN | OWNER_DISPLAY_NAME | \
       CHATTO_VERSION | CHATTO_AWS_ACCOUNT_ID | CHATTO_AWS_REGION | \
       CHATTO_S3_BUCKET | CHATTO_BACKUP_PREFIX | CHATTO_SNS_TOPIC_ARN | \
-      CHATTO_ALERT_EMAIL | TAILSCALE_HOSTNAME)
+      CHATTO_ALERT_EMAIL | CHATTO_SES_DOMAIN | CHATTO_SMTP_FROM | \
+      TAILSCALE_HOSTNAME)
       return 0
       ;;
     *)
@@ -158,6 +161,39 @@ validate_aws_identifiers() {
       "CHATTO_BACKUP_PREFIX may contain only letters, digits, dot, underscore, hyphen, and slash"
 }
 
+validate_ses_configuration() {
+  local from_domain
+  local label
+  local old_ifs=${IFS}
+  local labels=()
+
+  require_value CHATTO_SES_DOMAIN
+  require_value CHATTO_SMTP_FROM
+  validate_email CHATTO_SMTP_FROM
+  [ "${#CHATTO_SES_DOMAIN}" -le 253 ] ||
+    operator_die "CHATTO_SES_DOMAIN is longer than 253 characters"
+  [[ "${CHATTO_SES_DOMAIN}" == *.* ]] &&
+    [[ "${CHATTO_SES_DOMAIN}" != .* &&
+      "${CHATTO_SES_DOMAIN}" != *. &&
+      "${CHATTO_SES_DOMAIN}" != *..* &&
+      "${CHATTO_SES_DOMAIN}" != *[!a-z0-9.-]* ]] ||
+    operator_die "CHATTO_SES_DOMAIN must be a lowercase fully qualified DNS name"
+
+  IFS=.
+  read -r -a labels <<<"${CHATTO_SES_DOMAIN}"
+  IFS=${old_ifs}
+  for label in "${labels[@]}"; do
+    [ -n "${label}" ] && [ "${#label}" -le 63 ] &&
+      [[ "${label}" != -* && "${label}" != *- ]] ||
+      operator_die "CHATTO_SES_DOMAIN contains an invalid DNS label"
+  done
+
+  from_domain=${CHATTO_SMTP_FROM##*@}
+  [ "${from_domain}" = "${CHATTO_SES_DOMAIN}" ] ||
+    operator_die \
+      "CHATTO_SMTP_FROM must be an address directly below CHATTO_SES_DOMAIN"
+}
+
 # TAILSCALE_HOSTNAME is optional so pre-Tailscale deployment env files stay
 # valid; an empty value normalizes to the default machine name.
 validate_tailscale_hostname() {
@@ -205,6 +241,7 @@ validate_base_deployment_env() {
     operator_die "CHATTO_VERSION must remain pinned to the qualified v0.4.14 release"
   validate_tailscale_hostname
   validate_aws_identifiers
+  validate_ses_configuration
 }
 
 validate_provisioned_deployment_env() {

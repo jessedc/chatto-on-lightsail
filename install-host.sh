@@ -9,10 +9,12 @@ source "${SCRIPT_DIR}/chatto-operator-lib.sh"
 ACTION=
 ENV_FILE=
 CREDENTIALS_FILE=
+SMTP_CREDENTIALS_FILE=
 SKIP_OWNER=false
 INSTALL_TEMP_DIR=
 AWS_CONFIG_TEMP=
 AWS_CREDENTIALS_TEMP=
+SMTP_ENV_TEMP=
 AWS_CLI_FINGERPRINT=FB5DB77FD5C118B80511ADA8A6310ACC4672475C
 TAILSCALE_AUTHKEY_FILE=
 TAILSCALE_KEY_TEMP=
@@ -23,7 +25,7 @@ usage() {
 Usage:
   sudo ./install-host.sh prepare
   sudo ./install-host.sh install --env FILE [--credentials FILE]
-      [--tailscale-authkey FILE] [--skip-owner]
+      [--smtp-credentials FILE] [--tailscale-authkey FILE] [--skip-owner]
 
 prepare
   Idempotently installs base packages, swap, the chatto service account, and
@@ -37,6 +39,11 @@ install
 
 --credentials FILE
   Read AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from a mode-0600 literal
+  KEY=VALUE file produced by provision-aws.sh. If omitted and credentials are
+  not already installed, the script prompts without echoing the secret.
+
+--smtp-credentials FILE
+  Read CHATTO_SMTP_USERNAME and CHATTO_SMTP_PASSWORD from a mode-0600 literal
   KEY=VALUE file produced by provision-aws.sh. If omitted and credentials are
   not already installed, the script prompts without echoing the secret.
 
@@ -57,6 +64,9 @@ cleanup() {
   fi
   if [[ "${AWS_CREDENTIALS_TEMP}" == /etc/chatto/aws/.credentials.* ]]; then
     rm -f -- "${AWS_CREDENTIALS_TEMP}"
+  fi
+  if [[ "${SMTP_ENV_TEMP}" == /etc/chatto/.smtp.env.* ]]; then
+    rm -f -- "${SMTP_ENV_TEMP}"
   fi
   if [[ "${TAILSCALE_KEY_TEMP}" == /etc/chatto/.tailscale-authkey.* ]]; then
     rm -f -- "${TAILSCALE_KEY_TEMP}"
@@ -83,6 +93,11 @@ while [ "$#" -gt 0 ]; do
     --credentials)
       [ "$#" -ge 2 ] || operator_die "--credentials requires a file"
       CREDENTIALS_FILE=$2
+      shift 2
+      ;;
+    --smtp-credentials)
+      [ "$#" -ge 2 ] || operator_die "--smtp-credentials requires a file"
+      SMTP_CREDENTIALS_FILE=$2
       shift 2
       ;;
     --tailscale-authkey)
@@ -368,7 +383,12 @@ write_runtime_environment() {
     printf 'CHATTO_WEBSERVER_TLS_CACHE_DIR=/var/lib/chatto/certs\n'
     printf 'CHATTO_WEBSERVER_TLS_HTTP_PORT=80\n'
     printf 'CHATTO_AUTH_DIRECT_REGISTRATION=false\n'
-    printf 'CHATTO_SMTP_ENABLED=false\n'
+    printf 'CHATTO_SMTP_ENABLED=true\n'
+    printf 'CHATTO_SMTP_HOST=email-smtp.%s.amazonaws.com\n' \
+      "${CHATTO_AWS_REGION}"
+    printf 'CHATTO_SMTP_PORT=587\n'
+    printf 'CHATTO_SMTP_TLS=mandatory\n'
+    printf 'CHATTO_SMTP_FROM=%s\n' "${CHATTO_SMTP_FROM}"
     printf 'CHATTO_LIMITS_MAX_USERS=10\n'
     printf 'CHATTO_OPERATOR_API_ENABLED=true\n'
     printf 'CHATTO_OPERATOR_API_SOCKET_PATH=/run/chatto/operator.sock\n'
@@ -443,6 +463,98 @@ load_credentials_file() {
     printf -v "${name}" '%s' "${value}"
     seen="${seen}${name}|"
   done < "${credentials_file}"
+}
+
+load_smtp_credentials_file() {
+  local credentials_file=$1
+  local line
+  local name
+  local value
+  local seen='|'
+  local mode
+
+  [ -f "${credentials_file}" ] && [ ! -L "${credentials_file}" ] ||
+    operator_die \
+      "SMTP credential input must be a regular, non-symlink file"
+  mode=$(stat -c %a "${credentials_file}")
+  (( (8#${mode} & 8#077) == 0 )) ||
+    operator_die \
+      "SMTP credential input must not be readable by group or other users"
+
+  unset CHATTO_SMTP_USERNAME CHATTO_SMTP_PASSWORD
+  while IFS= read -r line || [ -n "${line}" ]; do
+    line=${line%$'\r'}
+    case "${line}" in
+      '' | \#*)
+        continue
+        ;;
+    esac
+    [[ "${line}" == *=* ]] ||
+      operator_die "invalid SMTP credential input line"
+    name=${line%%=*}
+    value=${line#*=}
+    case "${name}" in
+      CHATTO_SMTP_USERNAME | CHATTO_SMTP_PASSWORD)
+        ;;
+      *)
+        operator_die "unsupported SMTP credential variable: ${name}"
+        ;;
+    esac
+    case "${seen}" in
+      *"|${name}|"*)
+        operator_die "duplicate SMTP credential variable: ${name}"
+        ;;
+    esac
+    [[ ! "${value}" =~ [[:cntrl:]] ]] ||
+      operator_die "SMTP credential values must not contain control characters"
+    printf -v "${name}" '%s' "${value}"
+    seen="${seen}${name}|"
+  done < "${credentials_file}"
+}
+
+validate_smtp_credentials() {
+  [[ "${CHATTO_SMTP_USERNAME:-}" =~ ^A[A-Z0-9]{19}$ ]] ||
+    operator_die "SES SMTP username has an unexpected format"
+  [ -n "${CHATTO_SMTP_PASSWORD:-}" ] &&
+    [ "${#CHATTO_SMTP_PASSWORD}" -eq 44 ] &&
+    [[ "${CHATTO_SMTP_PASSWORD}" =~ ^[A-Za-z0-9+/]+$ ]] ||
+    operator_die "SES SMTP password has an unexpected format"
+}
+
+configure_smtp_credentials() {
+  if [ -s /etc/chatto/smtp.env ] &&
+    [ -z "${SMTP_CREDENTIALS_FILE}" ]; then
+    load_smtp_credentials_file /etc/chatto/smtp.env
+    validate_smtp_credentials
+    unset CHATTO_SMTP_USERNAME CHATTO_SMTP_PASSWORD
+    operator_log "Protected SES SMTP credentials are already installed"
+    return
+  fi
+
+  if [ -n "${SMTP_CREDENTIALS_FILE}" ]; then
+    load_smtp_credentials_file "${SMTP_CREDENTIALS_FILE}"
+  else
+    [ -t 0 ] ||
+      operator_die \
+        "use --smtp-credentials FILE when no SMTP credentials are installed"
+    IFS= read -r -p 'chatto-smtp SMTP username: ' \
+      CHATTO_SMTP_USERNAME </dev/tty
+    IFS= read -r -s -p 'chatto-smtp SMTP password: ' \
+      CHATTO_SMTP_PASSWORD </dev/tty
+    printf '\n' >/dev/tty
+  fi
+  validate_smtp_credentials
+
+  SMTP_ENV_TEMP=$(mktemp /etc/chatto/.smtp.env.XXXXXX)
+  chmod 0600 "${SMTP_ENV_TEMP}"
+  {
+    printf 'CHATTO_SMTP_USERNAME=%s\n' "${CHATTO_SMTP_USERNAME}"
+    printf 'CHATTO_SMTP_PASSWORD=%s\n' "${CHATTO_SMTP_PASSWORD}"
+  } > "${SMTP_ENV_TEMP}"
+  chown root:root "${SMTP_ENV_TEMP}"
+  mv -f -- "${SMTP_ENV_TEMP}" /etc/chatto/smtp.env
+  SMTP_ENV_TEMP=
+  unset CHATTO_SMTP_USERNAME CHATTO_SMTP_PASSWORD
 }
 
 verify_aws_profile() {
@@ -648,7 +760,7 @@ if [ "${ACTION}" = prepare ]; then
   operator_log "Running idempotent base-instance preparation"
   bash "${SCRIPT_DIR}/chatto-lightsail-launch.sh"
   operator_log "Prepare phase completed. Reboot now, reconnect, then run:"
-  operator_log "  sudo ./install-host.sh install --env chatto-provisioned.env --credentials chatto-access-key.env --tailscale-authkey chatto-tailscale-authkey.env"
+  operator_log "  sudo ./install-host.sh install --env chatto-provisioned.env --credentials chatto-access-key.env --smtp-credentials chatto-smtp-credentials.env --tailscale-authkey chatto-tailscale-authkey.env"
   exit 0
 fi
 
@@ -711,6 +823,7 @@ chmod 0600 /etc/chatto/chatto.toml
 
 write_runtime_environment
 install_repository_artifacts
+configure_smtp_credentials
 configure_runtime_credentials
 configure_backup_passphrase
 
@@ -748,6 +861,6 @@ systemctl enable --now \
 enroll_tailscale
 
 operator_log "Host installation completed successfully"
-operator_log "Remove any transferred credential and auth-key file after storing its secret safely."
+operator_log "Remove any transferred AWS, SMTP, and auth-key file after storing required recovery material safely."
 operator_log "Keep public TCP 22 open until a tailnet SSH session succeeds; follow runbook section 7 before closing it."
 operator_log "Next, run: sudo ./verify-deployment.sh --run-backup --send-alert"

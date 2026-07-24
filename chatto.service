@@ -15,6 +15,7 @@ User=chatto
 Group=chatto
 WorkingDirectory=/var/lib/chatto
 EnvironmentFile=-/etc/chatto/chatto.env
+EnvironmentFile=-/etc/chatto/smtp.env
 ExecStart=/usr/local/bin/chatto run --config /etc/chatto/chatto.toml
 Restart=on-failure
 RestartSec=5

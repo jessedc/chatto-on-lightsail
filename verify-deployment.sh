@@ -108,12 +108,36 @@ fi
 
 require_file_state /etc/chatto/chatto.toml 'chatto:chatto 600'
 require_file_state /etc/chatto/chatto.env 'root:root 644'
+require_file_state /etc/chatto/smtp.env 'root:root 600'
 require_file_state /etc/chatto/deployment.env 'root:root 600'
 require_file_state /etc/chatto/backup.env 'root:root 644'
 require_file_state /etc/chatto/backup-passphrase 'chatto:chatto 600'
 require_file_state /etc/chatto/aws/config 'chatto:chatto 600'
 require_file_state /etc/chatto/aws/credentials 'chatto:chatto 600'
 require_file_state /etc/chatto/owner-created 'root:root 600'
+
+grep -Fqx 'CHATTO_AUTH_DIRECT_REGISTRATION=false' \
+  /etc/chatto/chatto.env ||
+  operator_die "direct registration must remain disabled"
+grep -Fqx 'CHATTO_SMTP_ENABLED=true' /etc/chatto/chatto.env ||
+  operator_die "SMTP is not enabled"
+grep -Fqx \
+  "CHATTO_SMTP_HOST=email-smtp.${CHATTO_AWS_REGION}.amazonaws.com" \
+  /etc/chatto/chatto.env ||
+  operator_die "SMTP host does not match the deployment region"
+grep -Fqx 'CHATTO_SMTP_PORT=587' /etc/chatto/chatto.env ||
+  operator_die "SMTP port must be 587"
+grep -Fqx 'CHATTO_SMTP_TLS=mandatory' /etc/chatto/chatto.env ||
+  operator_die "SMTP must require STARTTLS"
+grep -Fqx "CHATTO_SMTP_FROM=${CHATTO_SMTP_FROM}" \
+  /etc/chatto/chatto.env ||
+  operator_die "SMTP sender does not match the deployment record"
+grep -Eq '^CHATTO_SMTP_USERNAME=A[A-Z0-9]{19}$' \
+  /etc/chatto/smtp.env ||
+  operator_die "installed SMTP username has an unexpected format"
+grep -Eq '^CHATTO_SMTP_PASSWORD=[A-Za-z0-9+/]{44}$' \
+  /etc/chatto/smtp.env ||
+  operator_die "installed SMTP password has an unexpected format"
 
 operator_log "Checking systemd units and timers"
 systemd-analyze verify \
@@ -154,6 +178,13 @@ for _ in $(seq 1 12); do
 done
 [ "${health_ready}" = true ] ||
   operator_die "HTTPS health or readiness did not succeed"
+
+operator_log "Checking mandatory TLS connectivity to Amazon SES SMTP"
+curl --fail --silent --show-error --ssl-reqd \
+  --connect-timeout 10 --max-time 20 \
+  "smtp://email-smtp.${CHATTO_AWS_REGION}.amazonaws.com:587" \
+  >/dev/null ||
+  operator_die "could not establish mandatory TLS with the SES SMTP endpoint"
 
 http_headers=$(curl --silent --show-error --max-time 10 \
   --resolve "${CHAT_HOST}:80:127.0.0.1" \

@@ -10,33 +10,54 @@ ENV_FILE=
 OUTPUT_FILE=./chatto-provisioned.env
 ACCESS_KEY_OUTPUT=
 ACCESS_KEY_TEMP=
+SMTP_CREDENTIALS_OUTPUT=
+SMTP_CREDENTIALS_TEMP=
+SMTP_ACCESS_KEY_ID_TEMP=
 AWS_BIN=${AWS_BIN:-aws}
 TEMP_DIR=
+SES_IDENTITY_READY=false
+SES_PRODUCTION_READY=false
 
 usage() {
   cat <<'EOF'
 Usage:
   ./provision-aws.sh --env FILE [--output FILE]
-      [--access-key-output FILE]
+      [--access-key-output FILE] [--smtp-credentials-output FILE]
 
 Run this command on an operator workstation or in AWS CloudShell with an
 administrative AWS identity. It idempotently provisions and verifies:
 
   - the private, encrypted, versioned S3 backup bucket;
   - the chatto-operations SNS topic and email subscription;
-  - the restricted chatto-backup IAM user and inline policy.
+  - the Amazon SES sending-domain identity;
+  - restricted chatto-backup and chatto-smtp IAM users.
 
 --access-key-output creates the runtime user's first access key and writes it
 to a new mode-0600 file. The file is never printed and is never overwritten.
 Store the secret in a password manager and remove the temporary file after the
 host installation succeeds.
+
+--smtp-credentials-output creates the regional SES SMTP user's first access
+key, derives its SMTP password, and writes both to a new mode-0600 file. The
+AWS secret access key is not retained. Publish the reported DKIM records and
+obtain SES production access before this credential can be created.
 EOF
 }
 
 cleanup() {
+  if [ -n "${SMTP_ACCESS_KEY_ID_TEMP}" ]; then
+    "${AWS_BIN}" iam delete-access-key \
+      --user-name chatto-smtp \
+      --access-key-id "${SMTP_ACCESS_KEY_ID_TEMP}" \
+      --output json >/dev/null 2>&1 || true
+  fi
   if [ -n "${ACCESS_KEY_TEMP}" ] &&
     [[ "${ACCESS_KEY_TEMP}" == */.chatto-access-key.* ]]; then
     rm -f -- "${ACCESS_KEY_TEMP}"
+  fi
+  if [ -n "${SMTP_CREDENTIALS_TEMP}" ] &&
+    [[ "${SMTP_CREDENTIALS_TEMP}" == */.chatto-smtp-credentials.* ]]; then
+    rm -f -- "${SMTP_CREDENTIALS_TEMP}"
   fi
   if [ -n "${TEMP_DIR}" ] && [[ "${TEMP_DIR}" == */chatto-provision.* ]]; then
     rm -rf -- "${TEMP_DIR}"
@@ -61,6 +82,12 @@ while [ "$#" -gt 0 ]; do
       ACCESS_KEY_OUTPUT=$2
       shift 2
       ;;
+    --smtp-credentials-output)
+      [ "$#" -ge 2 ] ||
+        operator_die "--smtp-credentials-output requires a file"
+      SMTP_CREDENTIALS_OUTPUT=$2
+      shift 2
+      ;;
     -h | --help)
       usage
       exit 0
@@ -79,6 +106,7 @@ done
 require_command "${AWS_BIN}"
 require_command jq
 require_command mktemp
+require_command python3
 load_deployment_env "${ENV_FILE}"
 validate_base_deployment_env
 
@@ -90,6 +118,33 @@ TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/chatto-provision.XXXXXX")
 LIFECYCLE_FILE="${TEMP_DIR}/lifecycle.json"
 BUCKET_POLICY_FILE="${TEMP_DIR}/bucket-policy.json"
 RUNTIME_POLICY_FILE="${TEMP_DIR}/runtime-policy.json"
+SMTP_POLICY_FILE="${TEMP_DIR}/smtp-policy.json"
+
+generate_ses_smtp_password() {
+  local secret_access_key=$1
+  local region=$2
+
+  printf '%s' "${secret_access_key}" |
+    python3 -c '
+import base64
+import hashlib
+import hmac
+import sys
+
+region = sys.argv[1].encode()
+secret = sys.stdin.buffer.read()
+
+def sign(key, message):
+    return hmac.new(key, message, hashlib.sha256).digest()
+
+key = sign(b"AWS4" + secret, b"11111111")
+key = sign(key, region)
+key = sign(key, b"ses")
+key = sign(key, b"aws4_request")
+key = sign(key, b"SendRawEmail")
+sys.stdout.write(base64.b64encode(bytes([4]) + key).decode())
+' "${region}"
+}
 
 operator_log "Checking the operator AWS identity"
 identity_json=$("${AWS_BIN}" sts get-caller-identity --output json)
@@ -286,6 +341,42 @@ if ! jq -e --arg email "${CHATTO_ALERT_EMAIL}" '
     --output json)
 fi
 
+operator_log "Provisioning SES identity ${CHATTO_SES_DOMAIN}"
+if ! ses_identity_json=$("${AWS_BIN}" sesv2 get-email-identity \
+  --email-identity "${CHATTO_SES_DOMAIN}" \
+  --output json 2>/dev/null); then
+  ses_identity_json=$("${AWS_BIN}" sesv2 create-email-identity \
+    --email-identity "${CHATTO_SES_DOMAIN}" \
+    --output json)
+fi
+[ "$(jq -er '.IdentityType' <<<"${ses_identity_json}")" = DOMAIN ] ||
+  operator_die "SES returned a non-domain identity for ${CHATTO_SES_DOMAIN}"
+if ! jq -e '.DkimAttributes.SigningEnabled == true' \
+  <<<"${ses_identity_json}" >/dev/null; then
+  "${AWS_BIN}" sesv2 put-email-identity-dkim-attributes \
+    --email-identity "${CHATTO_SES_DOMAIN}" \
+    --signing-enabled \
+    --output json >/dev/null
+  ses_identity_json=$("${AWS_BIN}" sesv2 get-email-identity \
+    --email-identity "${CHATTO_SES_DOMAIN}" \
+    --output json)
+fi
+if jq -e '
+  .VerifiedForSendingStatus == true and
+  .DkimAttributes.SigningEnabled == true and
+  .DkimAttributes.Status == "SUCCESS"
+' <<<"${ses_identity_json}" >/dev/null; then
+  SES_IDENTITY_READY=true
+fi
+
+ses_account_json=$("${AWS_BIN}" sesv2 get-account --output json)
+if jq -e '
+  .SendingEnabled == true and
+  .ProductionAccessEnabled == true
+' <<<"${ses_account_json}" >/dev/null; then
+  SES_PRODUCTION_READY=true
+fi
+
 operator_log "Provisioning restricted IAM user chatto-backup"
 if ! "${AWS_BIN}" iam get-user \
   --user-name chatto-backup --output json >/dev/null 2>&1; then
@@ -426,6 +517,137 @@ if [ -n "${ACCESS_KEY_OUTPUT}" ]; then
   access_key_count=1
 fi
 
+operator_log "Provisioning restricted IAM user chatto-smtp"
+if ! "${AWS_BIN}" iam get-user \
+  --user-name chatto-smtp --output json >/dev/null 2>&1; then
+  "${AWS_BIN}" iam create-user \
+    --user-name chatto-smtp --output json >/dev/null
+fi
+
+smtp_user_json=$("${AWS_BIN}" iam get-user \
+  --user-name chatto-smtp --output json)
+expected_smtp_user_arn="arn:aws:iam::${CHATTO_AWS_ACCOUNT_ID}:user/chatto-smtp"
+[ "$(jq -er '.User.Arn' <<<"${smtp_user_json}")" = \
+  "${expected_smtp_user_arn}" ] ||
+  operator_die "chatto-smtp exists at an unexpected IAM path or account"
+
+if "${AWS_BIN}" iam get-login-profile \
+  --user-name chatto-smtp --output json >/dev/null 2>&1; then
+  operator_die "chatto-smtp has console access; remove its login profile first"
+fi
+
+smtp_attached_json=$("${AWS_BIN}" iam list-attached-user-policies \
+  --user-name chatto-smtp --output json)
+[ "$(jq -r '.AttachedPolicies | length' \
+  <<<"${smtp_attached_json}")" -eq 0 ] ||
+  operator_die "chatto-smtp has managed policies attached; remove them first"
+
+smtp_groups_json=$("${AWS_BIN}" iam list-groups-for-user \
+  --user-name chatto-smtp --output json)
+[ "$(jq -r '.Groups | length' <<<"${smtp_groups_json}")" -eq 0 ] ||
+  operator_die "chatto-smtp belongs to an IAM group; remove it first"
+
+smtp_inline_json=$("${AWS_BIN}" iam list-user-policies \
+  --user-name chatto-smtp --output json)
+if ! jq -e '.PolicyNames | all(. == "ChattoSESSend")' \
+  <<<"${smtp_inline_json}" >/dev/null; then
+  operator_die "chatto-smtp has an unexpected inline policy"
+fi
+
+ses_identity_arn="arn:aws:ses:${CHATTO_AWS_REGION}:${CHATTO_AWS_ACCOUNT_ID}:identity/${CHATTO_SES_DOMAIN}"
+jq -n \
+  --arg identity "${ses_identity_arn}" \
+  --arg from "${CHATTO_SMTP_FROM}" '{
+  Version: "2012-10-17",
+  Statement: [{
+    Sid: "SendChattoTransactionalEmail",
+    Effect: "Allow",
+    Action: "ses:SendRawEmail",
+    Resource: $identity,
+    Condition: {
+      StringEquals: {
+        "ses:FromAddress": $from
+      }
+    }
+  }]
+}' > "${SMTP_POLICY_FILE}"
+
+"${AWS_BIN}" iam put-user-policy \
+  --user-name chatto-smtp \
+  --policy-name ChattoSESSend \
+  --policy-document "file://${SMTP_POLICY_FILE}"
+installed_smtp_policy=$("${AWS_BIN}" iam get-user-policy \
+  --user-name chatto-smtp \
+  --policy-name ChattoSESSend \
+  --output json)
+expected_smtp_policy=$(jq -Sc "${policy_normalizer}" \
+  "${SMTP_POLICY_FILE}")
+actual_smtp_policy=$(jq -Sc \
+  ".PolicyDocument | ${policy_normalizer}" \
+  <<<"${installed_smtp_policy}")
+[ "${actual_smtp_policy}" = "${expected_smtp_policy}" ] ||
+  operator_die "installed SMTP IAM policy differs from the requested policy"
+
+smtp_access_keys_json=$("${AWS_BIN}" iam list-access-keys \
+  --user-name chatto-smtp --output json)
+smtp_access_key_count=$(jq -r \
+  '.AccessKeyMetadata | length' <<<"${smtp_access_keys_json}")
+smtp_active_key_count=$(jq -r \
+  '[.AccessKeyMetadata[] | select(.Status == "Active")] | length' \
+  <<<"${smtp_access_keys_json}")
+[ "${smtp_access_key_count}" -le 1 ] ||
+  operator_die "chatto-smtp has more than one access key"
+[ "${smtp_access_key_count}" -eq "${smtp_active_key_count}" ] ||
+  operator_die "chatto-smtp has an inactive access key; delete it first"
+
+if [ -n "${SMTP_CREDENTIALS_OUTPUT}" ] &&
+  [ "${SES_IDENTITY_READY}" = true ] &&
+  [ "${SES_PRODUCTION_READY}" = true ]; then
+  smtp_credentials_output_dir=$(dirname "${SMTP_CREDENTIALS_OUTPUT}")
+  if [ "${smtp_access_key_count}" -ne 0 ]; then
+    operator_die \
+      "an SMTP access key already exists; AWS cannot recover its secret, so omit --smtp-credentials-output"
+  fi
+  [ ! -e "${SMTP_CREDENTIALS_OUTPUT}" ] &&
+    [ ! -L "${SMTP_CREDENTIALS_OUTPUT}" ] ||
+    operator_die \
+      "refusing to overwrite SMTP credential file: ${SMTP_CREDENTIALS_OUTPUT}"
+  [ -d "${smtp_credentials_output_dir}" ] &&
+    [ -w "${smtp_credentials_output_dir}" ] ||
+    operator_die \
+      "SMTP credential output directory is not writable: ${smtp_credentials_output_dir}"
+  SMTP_CREDENTIALS_TEMP=$(mktemp \
+    "${smtp_credentials_output_dir}/.chatto-smtp-credentials.XXXXXX")
+  chmod 0600 "${SMTP_CREDENTIALS_TEMP}"
+
+  operator_log \
+    "Creating the regional SMTP credential in ${SMTP_CREDENTIALS_OUTPUT}"
+  smtp_access_key_json=$("${AWS_BIN}" iam create-access-key \
+    --user-name chatto-smtp --output json)
+  smtp_username=$(jq -er \
+    '.AccessKey.AccessKeyId' <<<"${smtp_access_key_json}")
+  SMTP_ACCESS_KEY_ID_TEMP=${smtp_username}
+  smtp_secret_access_key=$(jq -er \
+    '.AccessKey.SecretAccessKey' <<<"${smtp_access_key_json}")
+  smtp_password=$(generate_ses_smtp_password \
+    "${smtp_secret_access_key}" "${CHATTO_AWS_REGION}")
+  [[ "${smtp_username}" =~ ^A[A-Z0-9]{19}$ ]] ||
+    operator_die "created SMTP access key ID has an unexpected format"
+  [ "${#smtp_password}" -eq 44 ] &&
+    [[ "${smtp_password}" =~ ^[A-Za-z0-9+/]+$ ]] ||
+    operator_die "derived SES SMTP password has an unexpected format"
+  umask 077
+  {
+    printf 'CHATTO_SMTP_USERNAME=%s\n' "${smtp_username}"
+    printf 'CHATTO_SMTP_PASSWORD=%s\n' "${smtp_password}"
+  } > "${SMTP_CREDENTIALS_TEMP}"
+  mv -- "${SMTP_CREDENTIALS_TEMP}" "${SMTP_CREDENTIALS_OUTPUT}"
+  SMTP_CREDENTIALS_TEMP=
+  SMTP_ACCESS_KEY_ID_TEMP=
+  unset smtp_secret_access_key smtp_password smtp_access_key_json
+  smtp_access_key_count=1
+fi
+
 output_dir=$(dirname "${OUTPUT_FILE}")
 [ -d "${output_dir}" ] ||
   operator_die "output directory does not exist: ${output_dir}"
@@ -434,6 +656,35 @@ write_deployment_env "${output_temp}"
 chmod 0600 "${output_temp}"
 mv -f -- "${output_temp}" "${OUTPUT_FILE}"
 operator_log "Wrote the verified deployment record to ${OUTPUT_FILE}"
+
+if [ "${SES_IDENTITY_READY}" != true ]; then
+  [ "$(jq -r '.DkimAttributes.Tokens | length' \
+    <<<"${ses_identity_json}")" -eq 3 ] ||
+    operator_die "SES did not return exactly three Easy DKIM tokens"
+  signing_hosted_zone=$(jq -er \
+    '.DkimAttributes.SigningHostedZone // empty' \
+    <<<"${ses_identity_json}") ||
+    operator_die "SES did not return an Easy DKIM signing hosted zone"
+  operator_log \
+    "Publish these CNAME records in DNS for ${CHATTO_SES_DOMAIN}:"
+  while IFS= read -r dkim_token; do
+    [ -n "${dkim_token}" ] || continue
+    operator_log \
+      "  ${dkim_token}._domainkey.${CHATTO_SES_DOMAIN} CNAME ${dkim_token}.${signing_hosted_zone}"
+  done < <(jq -r '.DkimAttributes.Tokens[]?' <<<"${ses_identity_json}")
+  operator_die \
+    "publish the SES Easy DKIM records, wait for verification, then rerun this command"
+fi
+
+if [ "${SES_PRODUCTION_READY}" != true ]; then
+  operator_die \
+    "SES production sending is not enabled in ${CHATTO_AWS_REGION}; request production access in SES and rerun this command"
+fi
+
+if [ "${smtp_access_key_count}" -eq 0 ]; then
+  operator_die \
+    "no SMTP access key exists; rerun with --smtp-credentials-output FILE"
+fi
 
 if [ "${access_key_count}" -eq 0 ]; then
   operator_die \

@@ -1,4 +1,5 @@
 chatto-deploy.env
 chatto-provisioned.env
 chatto-access-key.env
+chatto-smtp-credentials.env
 chatto-tailscale-authkey.env

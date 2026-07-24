@@ -20,18 +20,19 @@ repository root.
 
 ### 1. Install and verify the operator tools
 
-The operator workstation requires Bash, AWS CLI v2.32 or newer, `jq`,
-ShellCheck, `curl`, `tar`, OpenSSH (`ssh` and `scp`), `dig`, and the standard
-`grep`, `mktemp`, `sed`, and `stat` utilities. ShellCheck is a required
-repository preflight, not an optional check.
+The operator workstation requires Bash, AWS CLI v2.32 or newer, Python 3,
+`jq`, ShellCheck, `curl`, `tar`, OpenSSH (`ssh` and `scp`), `dig`, and the
+standard `grep`, `mktemp`, `sed`, and `stat` utilities. Python derives the
+region-specific SES SMTP password without exposing the AWS secret key in a
+process argument. ShellCheck is a required repository preflight.
 
-Install `jq` and ShellCheck with Homebrew, then install AWS CLI v2 from the
-official AWS package:
+Install Python, `jq`, and ShellCheck with Homebrew, then install AWS CLI v2
+from the official AWS package:
 
 ```bash
 (
   set -euo pipefail
-  brew install jq shellcheck
+  brew install jq shellcheck python
   aws_cli_tmp=$(mktemp -d)
   curl -fLo "${aws_cli_tmp}/AWSCLIV2.pkg" \
     https://awscli.amazonaws.com/AWSCLIV2.pkg
@@ -50,7 +51,7 @@ if AWS CLI is older than v2.32:
 (
   set -euo pipefail
   for tool in \
-    bash aws jq shellcheck curl tar ssh scp dig grep mktemp sed stat; do
+    bash aws python3 jq shellcheck curl tar ssh scp dig grep mktemp sed stat; do
     command -v "${tool}" >/dev/null 2>&1 || {
       echo "Missing required operator tool: ${tool}" >&2
       exit 1
@@ -72,7 +73,7 @@ if AWS CLI is older than v2.32:
 ### 2. Authenticate your AWS administrator profile
 
 Use temporary credentials for a human administrator. The administrator must be
-allowed to create and configure S3, SNS, and IAM resources, including the
+allowed to create and configure S3, SNS, SES, and IAM resources, including the
 restricted IAM user and access key used by the Lightsail host. Do not use the
 `chatto-backup` runtime identity, and never create root-user access keys.
 
@@ -82,7 +83,7 @@ Choose the path that matches the AWS account.
 
 Confirm in the IAM Identity Center console that your user is assigned to the
 target AWS account with an administrator permission set. The permission set
-must permit IAM administration as well as S3 and SNS administration;
+must permit IAM administration as well as S3, SNS, and SES administration;
 `AdministratorAccess` satisfies this deployment. Record the AWS access portal
 URL and the Region where IAM Identity Center is configured, then run:
 
@@ -294,6 +295,9 @@ Do not add shell quotes. Values are read literally, without shell evaluation.
 Set `CHATTO_AWS_REGION` to the region containing the Lightsail instance, choose
 a globally unique S3 bucket name, and leave `CHATTO_AWS_ACCOUNT_ID` and
 `CHATTO_SNS_TOPIC_ARN` blank: provisioning fills those generated values.
+Set `CHATTO_SES_DOMAIN=jessedc.dev` and
+`CHATTO_SMTP_FROM=noreply@jessedc.dev`; the sender must be directly below the
+configured SES domain.
 
 Before continuing, inspect every line and make sure none of the example
 addresses or placeholder bucket name remains:
@@ -349,26 +353,40 @@ chmod +x provision-aws.sh
 ./provision-aws.sh \
   --env chatto-deploy.env \
   --output chatto-provisioned.env \
-  --access-key-output chatto-access-key.env
+  --access-key-output chatto-access-key.env \
+  --smtp-credentials-output chatto-smtp-credentials.env
 ```
 
-The command creates and verifies the S3 bucket controls, SNS topic, restricted
-`chatto-backup` IAM user, and runtime policy. It writes:
+The command creates and verifies the S3 bucket controls, SNS topic, SES domain
+identity, and restricted `chatto-backup` and `chatto-smtp` IAM users. It
+writes:
 
 - `chatto-provisioned.env`: non-secret, normalized deployment inputs.
 - `chatto-access-key.env`: the one-time runtime access key, mode `0600`.
+- `chatto-smtp-credentials.env`: the regional SMTP username and derived
+  password, mode `0600`, once SES is ready.
 
-The first run normally stops after AWS sends the SNS confirmation email.
-Confirm the subscription, then rerun without creating another access key:
+The first run normally stops while SNS confirmation and SES domain
+verification are pending. Confirm the SNS subscription. Add each CNAME printed
+under `Publish these CNAME records` to the DNS zone for `jessedc.dev`; do not
+alter the record names or targets. In the SES console for
+`CHATTO_AWS_REGION`, request production access so Chatto can send to recipients
+that are not separately verified SES identities.
+
+After SNS is confirmed, Easy DKIM reports `Verified`, and SES production
+access is approved, rerun without creating another backup access key:
 
 ```bash
 ./provision-aws.sh \
   --env chatto-deploy.env \
-  --output chatto-provisioned.env
+  --output chatto-provisioned.env \
+  --smtp-credentials-output chatto-smtp-credentials.env
 ```
 
-Store the access-key secret in the password manager. AWS never reveals it
-again.
+If the first run already created the SMTP credential, omit
+`--smtp-credentials-output` on the rerun. The script never overwrites a
+credential output, and AWS cannot recover either access-key secret. Store both
+credential files in the password manager.
 
 ## 2. Transfer the host installer
 
@@ -385,6 +403,7 @@ scp \
   /tmp/chatto-host-installer.tgz \
   chatto-provisioned.env \
   chatto-access-key.env \
+  chatto-smtp-credentials.env \
   chatto-tailscale-authkey.env \
   admin@LIGHTSAIL_IP:
 
@@ -392,6 +411,7 @@ ssh admin@LIGHTSAIL_IP
 mkdir -p chatto-on-lightsail
 tar -xzf chatto-host-installer.tgz -C chatto-on-lightsail
 mv chatto-provisioned.env chatto-access-key.env \
+  chatto-smtp-credentials.env \
   chatto-tailscale-authkey.env chatto-on-lightsail/
 cd chatto-on-lightsail
 chmod +x install-host.sh verify-deployment.sh
@@ -418,6 +438,7 @@ cd chatto-on-lightsail
 sudo ./install-host.sh install \
   --env chatto-provisioned.env \
   --credentials chatto-access-key.env \
+  --smtp-credentials chatto-smtp-credentials.env \
   --tailscale-authkey chatto-tailscale-authkey.env
 ```
 
@@ -432,6 +453,8 @@ The install phase:
   rerun.
 - Installs the low-memory, private-community policy through
   `/etc/chatto/chatto.env`.
+- Installs the SES SMTP credential in `/etc/chatto/smtp.env` with mode `0600`
+  and configures mandatory STARTTLS to the regional SES endpoint.
 - Installs and starts the hardened service, backups, alerts, reboot check, and
   Debian security-update policy.
 - Prompts for the externally stored backup passphrase.
@@ -446,7 +469,7 @@ secret Chatto configuration directly into a mode-`0600` recovery archive:
 ```bash
 umask 077
 ssh admin@LIGHTSAIL_IP \
-  'sudo tar -C /etc/chatto -czf - chatto.toml chatto.env' \
+  'sudo tar -C /etc/chatto -czf - chatto.toml chatto.env smtp.env' \
   > chatto-recovery-config.tgz
 chmod 0600 chatto-recovery-config.tgz
 tar -tzf chatto-recovery-config.tgz
@@ -456,6 +479,7 @@ Store that archive in the external password manager together with:
 
 - The owner password and backup passphrase.
 - The `chatto-backup` access key ID and secret.
+- The `chatto-smtp` SMTP username and derived SMTP password.
 - The non-secret `chatto-provisioned.env` deployment record.
 
 Require the password-manager copies to be readable before deleting any
@@ -465,7 +489,8 @@ credential and auth-key inputs. The installed AWS copy remains protected at
 single-use:
 
 ```bash
-rm chatto-access-key.env chatto-tailscale-authkey.env
+rm chatto-access-key.env chatto-smtp-credentials.env \
+  chatto-tailscale-authkey.env
 ```
 
 On the workstation, remove the temporary secret files after confirming their
@@ -473,6 +498,7 @@ password-manager copies:
 
 ```bash
 rm chatto-access-key.env \
+  chatto-smtp-credentials.env \
   chatto-tailscale-authkey.env \
   chatto-recovery-config.tgz
 ```
@@ -488,9 +514,14 @@ Run the live backup and alert paths:
 sudo ./verify-deployment.sh --run-backup --send-alert
 ```
 
-Confirm the test email arrives. Log in as the owner, create an ordinary member
-over SSH, and verify messaging and a 10 MB attachment between two browsers.
-The member command prompts for its password:
+Confirm the SNS test alert arrives. Log in as the owner, add an email address
+from account settings, and confirm that the Chatto verification message
+arrives from `noreply@jessedc.dev`. Complete the code challenge, then exercise
+password recovery and confirm the received message passes DKIM. Public
+registration must remain unavailable.
+
+Create an ordinary member over SSH, then verify messaging and a 10 MB
+attachment between two browsers. The member command prompts for its password:
 
 ```bash
 (
@@ -597,7 +628,8 @@ procedure, the exact firewall command, failure modes, and rollback.
 
 - `install-host.sh prepare` may be rerun safely after a partial base setup.
 - `install-host.sh install` preserves existing Chatto secrets, AWS
-  credentials, the backup passphrase, and the recorded owner.
+  credentials, SES SMTP credentials, the backup passphrase, and the recorded
+  owner.
 - `install-host.sh install` skips Tailscale enrollment while the node is
   already `Running`; a fresh enrollment always needs a newly minted auth key.
 - If the tailnet is ever unreachable after public TCP 22 was closed, re-add
@@ -608,5 +640,5 @@ procedure, the exact firewall command, failure modes, and rollback.
 - Neither installer upgrades or downgrades an existing different Chatto
   version. Use the runbook's verified backup and manual upgrade procedure.
 - A true recovery also needs the password-manager copies of
-  `/etc/chatto/chatto.toml`, `/etc/chatto/chatto.env`, and the backup
-  passphrase.
+  `/etc/chatto/chatto.toml`, `/etc/chatto/chatto.env`,
+  `/etc/chatto/smtp.env`, and the backup passphrase.
