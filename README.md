@@ -10,33 +10,236 @@ The deployment remains pinned to Chatto `v0.4.14`. The complete architecture,
 manual fallback, operational procedures, and acceptance rationale are in
 [`chatto-lightsail-plan.md`](chatto-lightsail-plan.md).
 
+Throughout this README, **operator workstation** means your Mac. **Lightsail
+host**, **instance**, and **server** mean the remote Debian 13 VM.
+
 ## Before installation
 
-Choose the Lightsail region and record the instance name. Create the Debian 13
-instance in that region, attach a static IPv4 address, and point the chosen chat
-hostname at it. This workflow evaluates the $5 public-IPv4 bundle; start with the
-$7/1 GB bundle instead if avoiding a snapshot-based replacement when the
-capacity gate fails is more important than testing the lowest-cost option.
+Complete these steps in order. Run all workstation commands in Bash from the
+repository root.
 
-Configure both Lightsail firewalls with the bootstrap rules:
+### 1. Install and verify the operator tools
 
-- TCP 80 and 443 from anywhere.
-- TCP 22 only from the operator's public IP where practical. This rule is
-  temporary: administrative SSH moves onto the tailnet, and the final
-  SSH-lockdown step removes public TCP 22 from both firewalls.
-- No other inbound ports.
+The operator workstation requires Bash, AWS CLI v2.32 or newer, `jq`,
+ShellCheck, `curl`, `tar`, OpenSSH (`ssh` and `scp`), `dig`, and the standard
+`grep`, `mktemp`, `sed`, and `stat` utilities. ShellCheck is a required
+repository preflight, not an optional check.
 
-Install AWS CLI v2 and `jq` on the operator workstation. Authenticate AWS CLI
-with the administrative identity that may provision the backup bucket, SNS
-topic, and restricted IAM user.
+Install `jq` and ShellCheck with Homebrew, then install AWS CLI v2 from the
+official AWS package:
 
-Prepare the tailnet on a Tailscale account whose workstation and other
-operator devices are already enrolled:
+```bash
+(
+  set -euo pipefail
+  brew install jq shellcheck
+  aws_cli_tmp=$(mktemp -d)
+  curl -fLo "${aws_cli_tmp}/AWSCLIV2.pkg" \
+    https://awscli.amazonaws.com/AWSCLIV2.pkg
+  sudo installer -pkg "${aws_cli_tmp}/AWSCLIV2.pkg" -target /
+  rm -rf -- "${aws_cli_tmp}"
+)
+```
 
-Add `tag:chatto` to the tailnet policy file. `tagOwners` controls who may apply
-the tag; it does not grant network access. Add a grant that permits the intended
-operator identity or group to reach TCP 22 on the tagged server. For an
-administrator-only setup:
+AWS publishes installer details and signature-verification instructions in its
+[AWS CLI v2 installation guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
+
+Run this gate after installation. Do not continue if a command is missing or
+if AWS CLI is older than v2.32:
+
+```bash
+(
+  set -euo pipefail
+  for tool in \
+    bash aws jq shellcheck curl tar ssh scp dig grep mktemp sed stat; do
+    command -v "${tool}" >/dev/null 2>&1 || {
+      echo "Missing required operator tool: ${tool}" >&2
+      exit 1
+    }
+  done
+
+  aws_version=$(aws --version 2>&1)
+  if [[ ! "${aws_version}" =~ ^aws-cli/2\.([0-9]+)\. ]] ||
+    ((BASH_REMATCH[1] < 32)); then
+    echo "AWS CLI v2.32 or newer is required; found: ${aws_version}" >&2
+    exit 1
+  fi
+  printf '%s\n' "${aws_version}"
+  jq --version
+  shellcheck --version
+)
+```
+
+### 2. Authenticate your AWS administrator profile
+
+Use temporary credentials for a human administrator. The administrator must be
+allowed to create and configure S3, SNS, and IAM resources, including the
+restricted IAM user and access key used by the Lightsail host. Do not use the
+`chatto-backup` runtime identity, and never create root-user access keys.
+
+Choose the path that matches the AWS account.
+
+#### Account already uses IAM Identity Center
+
+Confirm in the IAM Identity Center console that your user is assigned to the
+target AWS account with an administrator permission set. The permission set
+must permit IAM administration as well as S3 and SNS administration;
+`AdministratorAccess` satisfies this deployment. Record the AWS access portal
+URL and the Region where IAM Identity Center is configured, then run:
+
+```bash
+aws configure sso --profile chatto-admin
+aws sso login --profile chatto-admin
+```
+
+In the configuration wizard:
+
+- Use `chatto-admin` as the SSO session name.
+- Enter the access portal URL and IAM Identity Center Region exactly as shown
+  in the IAM Identity Center console. This Region can differ from the
+  Lightsail Region.
+- Select the intended AWS account and its administrator role.
+- Set the default client Region to the planned Lightsail Region and the output
+  format to `json`.
+
+See AWS's
+[IAM Identity Center CLI configuration](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html)
+for the corresponding console and wizard fields.
+
+#### Personal account without IAM Identity Center
+
+Create a dedicated `chatto-operator` IAM user and use browser-backed temporary
+credentials. Do not create a long-lived access key for this user:
+
+1. Sign in to the AWS Management Console with an existing administrator. If
+   the root user is the account's only identity, use it only for this initial
+   administrator setup, ensure root MFA is enabled, and sign it out afterward.
+2. Open **IAM → Users → Create user**. Name the user `chatto-operator`, enable
+   AWS Management Console access, and assign a unique password.
+3. Attach the AWS-managed `AdministratorAccess` and
+   `SignInLocalDevelopmentAccess` policies. The first permits this deployment's
+   provisioning work; the second permits browser-backed AWS CLI login.
+4. Open the new user's **Security credentials** tab. Under
+   **Multi-factor authentication (MFA)**, choose **Assign MFA device** and
+   enroll a passkey, security key, or authenticator application.
+5. Sign out of the bootstrap administrator or root session and sign in as
+   `chatto-operator`. Complete the MFA challenge before continuing.
+6. On the Mac, run the command below. Enter the planned Lightsail Region when
+   prompted and select the `chatto-operator` browser session:
+
+```bash
+aws login --profile chatto-admin
+```
+
+`aws login` stores refreshable temporary credentials rather than an IAM access
+key. The session lasts for at most 12 hours; rerun the command when it expires.
+See AWS's
+[browser-backed CLI login guide](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sign-in.html)
+for details.
+
+#### Verify either profile
+
+After completing either authentication path, select and verify the profile:
+
+```bash
+export AWS_PROFILE=chatto-admin
+aws sts get-caller-identity \
+  --query '{Account:Account,Arn:Arn}' \
+  --output table
+```
+
+Read the account ID and ARN in the output and confirm that they identify the
+intended AWS account and administrator user or role. Stop on an unexpected
+account, an ARN containing `root`, or any other unexpected identity. Set
+`AWS_PROFILE=chatto-admin` again in each new workstation shell used for this
+deployment.
+
+### 3. Create and verify the Lightsail instance and DNS
+
+Record the AWS account ID, Lightsail region, instance name, static IPv4
+address, chat hostname, and the operator's current public IP before continuing.
+Use the same region in every Lightsail and provisioning command.
+
+Print the workstation's current public IPv4 address with:
+
+```bash
+curl -4 -fsS https://checkip.amazonaws.com
+```
+
+In the Lightsail console:
+
+1. Select the deployment region.
+2. Create a Linux/Unix instance using the **OS Only / Debian 13** blueprint.
+3. Select the $5 public-IPv4 bundle to evaluate the lowest-cost option, or
+   start with the $7/1 GB bundle to avoid a snapshot-based replacement if the
+   later capacity gate rejects the $5 bundle.
+4. Give the instance its recorded name and wait for it to reach `Running`.
+5. Create a Lightsail static IPv4 address in the same region and attach it to
+   the instance.
+6. Create an `A` record for the chat hostname pointing to that static IPv4
+   address.
+
+Replace all `REPLACE_WITH_...` values below, then verify the instance and DNS.
+The instance output must show `running`, the Debian 13 blueprint, the intended
+bundle, and the attached static IPv4 address. The DNS command must return that
+same static IPv4 address.
+
+```bash
+aws lightsail get-instance \
+  --region REPLACE_WITH_REGION \
+  --instance-name REPLACE_WITH_INSTANCE_NAME \
+  --query \
+    'instance.{State:state.name,Blueprint:blueprintName,Bundle:bundleId,PublicIPv4:publicIpAddress}' \
+  --output table
+
+aws lightsail get-static-ips \
+  --region REPLACE_WITH_REGION \
+  --output table
+
+dig +short REPLACE_WITH_CHAT_HOST A
+dig +short REPLACE_WITH_CHAT_HOST AAAA
+```
+
+The `AAAA` result must be empty unless IPv6 was deliberately enabled and the
+hostname was deliberately pointed at this instance's public IPv6 address.
+
+### 4. Lock down both Lightsail firewalls for bootstrap
+
+In the instance's **Networking** tab, remove the default inbound rules and
+configure the IPv4 firewall with only:
+
+- TCP 80 from `0.0.0.0/0`.
+- TCP 443 from `0.0.0.0/0`.
+- TCP 22 from the operator's current public IPv4 address as a `/32`.
+
+If IPv6 is enabled, configure the separate IPv6 firewall with the equivalent
+rules: TCP 80 and 443 from `::/0`, and TCP 22 only from the operator's public
+IPv6 address as a `/128`. If TCP 22 cannot be restricted on IPv6, disable IPv6
+instead. Do not leave any other inbound ports open. If the operator's public IP
+changes before installation, update the TCP 22 rule before reconnecting.
+
+Inspect the effective rules from the workstation:
+
+```bash
+aws lightsail get-instance-port-states \
+  --region REPLACE_WITH_REGION \
+  --instance-name REPLACE_WITH_INSTANCE_NAME \
+  --output json |
+  jq '.portStates | map({
+    protocol, fromPort, toPort, cidrs, ipv6Cidrs, cidrListAliases
+  })'
+```
+
+Do not continue until the output matches the rules above. TCP 22 is temporary:
+administrative SSH moves onto the tailnet, and the final SSH-lockdown step
+removes public TCP 22 from both firewalls.
+
+### 5. Prepare Tailscale
+
+Use a Tailscale account whose workstation and other operator devices are
+already enrolled. Add `tag:chatto` to the tailnet policy file. `tagOwners`
+controls who may apply the tag; it does not grant network access. Add a grant
+that permits the intended operator identity or group to reach TCP 22 on the
+tagged server. For an administrator-only setup:
 
 ```json
 {
@@ -58,14 +261,27 @@ rules. Tailnets using legacy ACLs need the equivalent TCP 22 allow rule. Tagged
 nodes have no node-key expiry, so ordinary SSH over the tailnet never lapses
 silently. Tailscale SSH itself remains disabled.
 
-- In the admin console, create an auth key that is pre-authorized,
-  **not** reusable, not ephemeral, and tagged `tag:chatto`.
-- Save it on the workstation as a one-time input file:
+In the admin console, create an auth key with all of these properties:
+pre-authorized, **not** reusable, not ephemeral, and tagged `tag:chatto`. Save
+it without putting the key in shell history:
 
 ```bash
-printf 'TS_AUTHKEY=tskey-auth-REPLACE\n' > chatto-tailscale-authkey.env
-chmod 0600 chatto-tailscale-authkey.env
+(
+  set -euo pipefail
+  umask 077
+  read -r -s -p 'Tailscale auth key: ' TS_AUTHKEY
+  printf '\n'
+  [[ "${TS_AUTHKEY}" == tskey-auth-* ]] || {
+    echo "The value does not look like a Tailscale auth key" >&2
+    exit 1
+  }
+  printf 'TS_AUTHKEY=%s\n' "${TS_AUTHKEY}" \
+    > chatto-tailscale-authkey.env
+)
+test -s chatto-tailscale-authkey.env
 ```
+
+### 6. Create the literal deployment input
 
 Copy and edit the literal deployment input file:
 
@@ -79,6 +295,21 @@ Set `CHATTO_AWS_REGION` to the region containing the Lightsail instance, choose
 a globally unique S3 bucket name, and leave `CHATTO_AWS_ACCOUNT_ID` and
 `CHATTO_SNS_TOPIC_ARN` blank: provisioning fills those generated values.
 
+Before continuing, inspect every line and make sure none of the example
+addresses or placeholder bucket name remains:
+
+```bash
+if grep -nE 'example\.com|operator@example\.com|replace-with' \
+  chatto-deploy.env; then
+  echo "Replace every example value before continuing" >&2
+  false
+else
+  echo "Deployment input contains no example placeholders"
+fi
+```
+
+### 7. Store the human-generated secrets
+
 Create and save a random backup passphrase of at least 24 characters and a
 strong owner password in the external password manager before running the host
 installation. The installer prompts for both without placing either value in
@@ -90,23 +321,24 @@ Run these portable checks from the repository root before provisioning or
 copying artifacts:
 
 ```bash
-tests/operator-workflow-test.sh
-bash -n \
-  chatto-operator-lib.sh provision-aws.sh install-host.sh \
-  verify-deployment.sh chatto-lightsail-*.sh
+(
+  set -euo pipefail
+  tests/operator-workflow-test.sh
+  bash -n \
+    chatto-operator-lib.sh provision-aws.sh install-host.sh \
+    verify-deployment.sh chatto-lightsail-*.sh
+  shellcheck -x \
+    chatto-operator-lib.sh provision-aws.sh install-host.sh \
+    verify-deployment.sh chatto-lightsail-*.sh tests/*.sh
+)
 ```
 
-If ShellCheck is installed, also run:
+All three commands are required and must exit successfully. Do not provision
+AWS resources or copy artifacts to the host after a failed check.
 
-```bash
-shellcheck -x \
-  chatto-operator-lib.sh provision-aws.sh install-host.sh \
-  verify-deployment.sh chatto-lightsail-*.sh tests/*.sh
-```
-
-`systemd-analyze` is not normally available on macOS or Windows. The host
-installer validates every installed unit with `systemd-analyze verify` on
-Debian before starting the services.
+`systemd-analyze` is not normally available on macOS. The host installer
+validates every installed unit with `systemd-analyze verify` on Debian before
+starting the services.
 
 ## 1. Provision AWS
 
