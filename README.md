@@ -70,46 +70,14 @@ if AWS CLI is older than v2.32:
 )
 ```
 
-### 2. Authenticate your AWS administrator profile
+### 2. Authenticate the personal-account operator
 
-Use temporary credentials for a human administrator. The administrator must be
-allowed to create and configure S3, SNS, SES, and IAM resources, including the
-restricted IAM user and access key used by the Lightsail host. Do not use the
+This deployment uses a dedicated `chatto-operator` IAM user in the personal
+AWS account. The operator must be allowed to create and configure S3, SNS,
+SES, and IAM resources, including the restricted IAM users and access keys
+used by the Lightsail host. Use browser-backed temporary credentials and do
+not create a long-lived access key for `chatto-operator`. Do not use the
 `chatto-backup` runtime identity, and never create root-user access keys.
-
-Choose the path that matches the AWS account.
-
-#### Account already uses IAM Identity Center
-
-Confirm in the IAM Identity Center console that your user is assigned to the
-target AWS account with an administrator permission set. The permission set
-must permit IAM administration as well as S3, SNS, and SES administration;
-`AdministratorAccess` satisfies this deployment. Record the AWS access portal
-URL and the Region where IAM Identity Center is configured, then run:
-
-```bash
-aws configure sso --profile chatto-admin
-aws sso login --profile chatto-admin
-```
-
-In the configuration wizard:
-
-- Use `chatto-admin` as the SSO session name.
-- Enter the access portal URL and IAM Identity Center Region exactly as shown
-  in the IAM Identity Center console. This Region can differ from the
-  Lightsail Region.
-- Select the intended AWS account and its administrator role.
-- Set the default client Region to the planned Lightsail Region and the output
-  format to `json`.
-
-See AWS's
-[IAM Identity Center CLI configuration](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html)
-for the corresponding console and wizard fields.
-
-#### Personal account without IAM Identity Center
-
-Create a dedicated `chatto-operator` IAM user and use browser-backed temporary
-credentials. Do not create a long-lived access key for this user:
 
 1. Sign in to the AWS Management Console with an existing administrator. If
    the root user is the account's only identity, use it only for this initial
@@ -137,9 +105,9 @@ See AWS's
 [browser-backed CLI login guide](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sign-in.html)
 for details.
 
-#### Verify either profile
+#### Verify the operator profile
 
-After completing either authentication path, select and verify the profile:
+Select and verify the profile:
 
 ```bash
 export AWS_PROFILE=chatto-admin
@@ -149,7 +117,7 @@ aws sts get-caller-identity \
 ```
 
 Read the account ID and ARN in the output and confirm that they identify the
-intended AWS account and administrator user or role. Stop on an unexpected
+intended AWS account and the `chatto-operator` IAM user. Stop on an unexpected
 account, an ARN containing `root`, or any other unexpected identity. Set
 `AWS_PROFILE=chatto-admin` again in each new workstation shell used for this
 deployment.

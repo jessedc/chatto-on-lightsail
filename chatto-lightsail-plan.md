@@ -32,9 +32,13 @@ described in `README.md`:
 
 1. Copy `chatto-deploy.env.example` to `chatto-deploy.env` and fill in the
    literal values.
-2. Run `provision-aws.sh` from an administrative workstation. Confirm the SNS
-   email, publish the reported SES Easy DKIM records, obtain SES production
-   access, and rerun it until verification succeeds.
+2. In the personal AWS account, use the MFA-protected `chatto-operator` IAM
+   user with `AdministratorAccess`. Authenticate its browser-backed temporary
+   credentials with `aws login --profile chatto-admin`, export
+   `AWS_PROFILE=chatto-admin`, and run `provision-aws.sh` from the operator
+   workstation. Confirm the SNS email, publish the reported SES Easy DKIM
+   records, obtain SES production access, and rerun it until verification
+   succeeds.
 3. Transfer the deterministic host bundle, `chatto-provisioned.env`, and the
    temporary mode-`0600` AWS, SMTP, and Tailscale credential files to the
    instance.
@@ -495,7 +499,8 @@ public TCP 22 early:
    or `ssh admin@TAILNET_IP` works.
 3. Replace the public rule set on both stacks with 80 and 443 only. The
    Lightsail API replaces all rules atomically, so state the complete desired
-   set; run this from the administrative workstation identity:
+   set; run this from the `chatto-admin` workstation profile authenticated as
+   `chatto-operator`:
 
 ```bash
 aws lightsail put-instance-public-ports \
@@ -544,9 +549,10 @@ Chatto remains responsible for producing and restoring its own archive.
 
 Use two separate AWS identities:
 
-- Run one-time bucket provisioning from an operator workstation or AWS
-  CloudShell using an existing administrative identity. Never copy this
-  identity's credentials to the Lightsail instance.
+- Run one-time bucket provisioning from the operator workstation using the
+  MFA-protected `chatto-operator` IAM user and its browser-backed
+  `chatto-admin` CLI profile. Never copy this identity's credentials to the
+  Lightsail instance.
 - Give the instance a dedicated `chatto-backup` IAM user whose permissions are
   limited to the backup prefix. Lightsail does not provide the EC2
   instance-profile workflow, so this user uses a rotatable access key stored on
@@ -563,41 +569,6 @@ CHATTO_AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
   --query Account --output text)
 
 test -n "${CHATTO_AWS_ACCOUNT_ID}"
-```
-
-If the operator identity is not already an administrator, grant it a temporary
-inline policy containing the following actions on
-`arn:aws:s3:::GLOBALLY_UNIQUE_BUCKET_NAME`, then remove that policy after
-provisioning:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "ProvisionChattoBackupBucket",
-      "Effect": "Allow",
-      "Action": [
-        "s3:CreateBucket",
-        "s3:GetBucketLocation",
-        "s3:GetBucketOwnershipControls",
-        "s3:PutBucketOwnershipControls",
-        "s3:GetBucketPublicAccessBlock",
-        "s3:PutBucketPublicAccessBlock",
-        "s3:GetEncryptionConfiguration",
-        "s3:PutEncryptionConfiguration",
-        "s3:GetBucketVersioning",
-        "s3:PutBucketVersioning",
-        "s3:GetLifecycleConfiguration",
-        "s3:PutLifecycleConfiguration",
-        "s3:GetBucketPolicy",
-        "s3:GetBucketPolicyStatus",
-        "s3:PutBucketPolicy"
-      ],
-      "Resource": "arn:aws:s3:::GLOBALLY_UNIQUE_BUCKET_NAME"
-    }
-  ]
-}
 ```
 
 Create the bucket in the same region as Lightsail. `us-east-1` is the only
@@ -692,8 +663,8 @@ propagate. Wait 15 minutes before the first production upload.
 
 ### Provision the Operations SNS Topic
 
-Using the administrative provisioning identity, create the one permitted
-operations topic and subscribe the operator's email address:
+Using the `chatto-admin` profile authenticated as `chatto-operator`, create the
+one permitted operations topic and subscribe the operator's email address:
 
 ```bash
 CHATTO_ALERT_EMAIL=OPERATOR_EMAIL_ADDRESS
@@ -722,10 +693,8 @@ aws sns list-subscriptions-by-topic \
   --region "${CHATTO_AWS_REGION}"
 ```
 
-If the provisioning identity is delegated rather than administrative, it
-needs only the SNS topic and subscription actions required above and to inspect
-that one topic. Remove the temporary provisioning permission afterward. The
-server runtime identity receives no subscription or topic-management actions.
+The server runtime identity receives no subscription or topic-management
+actions.
 
 ### Provision SES Transactional Email
 
@@ -764,14 +733,8 @@ the raw AWS secret. Store the resulting username and SMTP password in
 
 ### Create the Runtime IAM User
 
-Have an IAM administrator create a user named `chatto-backup` with no console
-access. If this is delegated to the provisioning operator, temporarily grant
-that operator `iam:CreateUser`, `iam:GetUser`, `iam:GetLoginProfile`,
-`iam:PutUserPolicy`, `iam:GetUserPolicy`, `iam:ListUserPolicies`,
-`iam:ListAttachedUserPolicies`, `iam:CreateAccessKey`,
-`iam:ListAccessKeys`, `iam:UpdateAccessKey`, and `iam:DeleteAccessKey`, scoped to
-`arn:aws:iam::AWS_ACCOUNT_ID:user/chatto-backup`. Remove the delegation after
-the user and first key are configured.
+Using the `chatto-admin` profile authenticated as `chatto-operator`, create a
+user named `chatto-backup` with no console access.
 
 Replace the bucket, prefix, and SNS topic placeholders below, attach the result
 to `chatto-backup` as an inline policy named `ChattoBackupAndAlerts`, and do
@@ -1139,8 +1102,8 @@ sudo journalctl -u chatto --since "15 minutes ago"
 Verify AWS CLI, the runtime identity, and every S3 control created during
 provisioning. Run the identity and object checks with the protected
 `chatto-backup` profile; run bucket-configuration checks with the operator
-identity because the runtime identity intentionally cannot read or change
-those settings:
+`chatto-admin` profile because the runtime identity intentionally cannot read
+or change those settings:
 
 ```bash
 /usr/local/bin/aws --version
@@ -1367,7 +1330,8 @@ availability are explicitly outside this deployment.
   `/etc/chatto/deployment.env`, `/etc/chatto/backup.env`, `chatto-backup.service`,
   `chatto-backup.timer`, `chatto-backup-alert@.service`,
   `chatto-reboot-required.service`, `chatto-reboot-required.timer`, the local
-  operator Unix socket, AWS CLI v2 profile, private S3 prefix,
+  operator Unix socket, the browser-backed `chatto-admin` AWS CLI v2 profile,
+  private S3 prefix,
   `chatto-operations` SNS topic, `tailscaled`, the bundled
   `tailscale-archive-keyring.gpg`, and the one-time
   `chatto-tailscale-authkey.env` input.
