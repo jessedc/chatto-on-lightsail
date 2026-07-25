@@ -138,8 +138,9 @@ deployment.
 
 ### C. Create the Lightsail instance and record its values
 
-Print the workstation's current public IPv4 address and note it for the
-firewall step:
+Print the workstation's current public IPv4 address and confirm it is the
+expected network (no VPN or proxy in the path). The firewall step fetches
+this address itself; this check is to catch a wrong egress path early:
 
 ```bash
 curl -4 -fsS https://checkip.amazonaws.com
@@ -201,18 +202,45 @@ hostname was deliberately pointed at this instance's public IPv6 address.
 
 ### D. Lock down both Lightsail firewalls for bootstrap
 
-In the instance's **Networking** tab, remove the default inbound rules and
-configure the IPv4 firewall with only:
+The instance must end up with exactly three inbound rules:
 
 - TCP 80 from `0.0.0.0/0`.
 - TCP 443 from `0.0.0.0/0`.
 - TCP 22 from the operator's current public IPv4 address as a `/32`.
 
-If IPv6 is enabled, configure the separate IPv6 firewall with the equivalent
-rules: TCP 80 and 443 from `::/0`, and TCP 22 only from the operator's public
-IPv6 address as a `/128`. If TCP 22 cannot be restricted on IPv6, disable IPv6
-instead. Do not leave any other inbound ports open. If the operator's public IP
-changes before installation, update the TCP 22 rule before reconnecting.
+TCP 80 and 443 must be open to the entire internet before the install phase
+runs: Chatto obtains and renews its Let's Encrypt certificate through them,
+and while either port is blocked, issuance fails and every HTTPS request —
+including the later verification step — is refused with a
+`tlsv1 alert internal error`.
+
+Apply the rules from the workstation. `put-instance-public-ports` replaces
+the instance's entire inbound rule set with exactly the rules given, so this
+single command removes the Lightsail defaults and installs the three rules
+above in one step:
+
+```bash
+(
+  set -euo pipefail
+  region=$(./deployment-value.sh CHATTO_AWS_REGION)
+  instance=$(./deployment-value.sh LIGHTSAIL_INSTANCE_NAME)
+  operator_ip=$(curl -4 -fsS https://checkip.amazonaws.com)
+  aws lightsail put-instance-public-ports \
+    --region "${region}" \
+    --instance-name "${instance}" \
+    --port-infos \
+      'fromPort=80,toPort=80,protocol=TCP,cidrs=0.0.0.0/0' \
+      'fromPort=443,toPort=443,protocol=TCP,cidrs=0.0.0.0/0' \
+      "fromPort=22,toPort=22,protocol=TCP,cidrs=${operator_ip}/32"
+)
+```
+
+The command grants nothing over IPv6, which is correct for the default
+IPv4-only deployment. If IPv6 was deliberately enabled, add matching
+`ipv6Cidrs` entries — `::/0` for TCP 80 and 443, and the operator's public
+IPv6 address as a `/128` for TCP 22 — or disable IPv6 if TCP 22 cannot be
+restricted. If the operator's public IP changes before installation, rerun
+the command to update the TCP 22 rule before reconnecting.
 
 Inspect the effective rules from the workstation:
 
@@ -466,7 +494,7 @@ secret Chatto configuration directly into a mode-`0600` recovery archive:
 
 ```bash
 umask 077
-ssh "admin@$(./deployment-value.sh LIGHTSAIL_STATIC_IP)" \
+ssh chatto \
   'sudo tar -C /etc/chatto -czf - chatto.toml chatto.env smtp.env' \
   > chatto-recovery-config.tgz
 chmod 0600 chatto-recovery-config.tgz
@@ -630,7 +658,25 @@ ssh admin@TAILNET_IPV4
 ```
 
 Once that session works, remove TCP 22 from **both** the IPv4 and the IPv6
-Lightsail firewalls, confirm that a public-IP connection
+Lightsail firewalls. As in [section D](#d-lock-down-both-lightsail-firewalls-for-bootstrap),
+`put-instance-public-ports` replaces the whole inbound rule set, so listing
+only the web ports drops TCP 22 from both address families in one step:
+
+```bash
+(
+  set -euo pipefail
+  aws lightsail put-instance-public-ports \
+    --region "$(./deployment-value.sh CHATTO_AWS_REGION)" \
+    --instance-name "$(./deployment-value.sh LIGHTSAIL_INSTANCE_NAME)" \
+    --port-infos \
+      'fromPort=80,toPort=80,protocol=TCP,cidrs=0.0.0.0/0' \
+      'fromPort=443,toPort=443,protocol=TCP,cidrs=0.0.0.0/0'
+)
+```
+
+If IPv6 was deliberately enabled, keep the `ipv6Cidrs=::/0` entries for TCP
+80 and 443 from section D while omitting the TCP 22 rule. Confirm that a
+public-IP connection
 (`ssh "admin@$(./deployment-value.sh LIGHTSAIL_STATIC_IP)"`) now times out,
 and test break-glass access once. Afterward, the MagicDNS name is fine for daily use —
 first run `ssh -G chatto` and confirm its `hostname` line shows the tailnet
