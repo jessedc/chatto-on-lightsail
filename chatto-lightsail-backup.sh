@@ -93,14 +93,19 @@ backup_sha256=$("${SHA256SUM_BIN}" "${archive_path}" | awk '{print $1}')
   fail "could not determine the archive SHA-256 digest"
 
 echo "Uploading ${archive_name} (${backup_size} bytes, sha256=${backup_sha256})"
-"${AWS_BIN}" s3 cp "${archive_path}" \
-  "s3://${CHATTO_S3_BUCKET}/${object_key}" \
+# s3api put-object, not s3 cp: only the s3api commands accept
+# --expected-bucket-owner, and the ownership check must gate the upload
+# itself, not just the head-object verification afterwards.
+"${AWS_BIN}" s3api put-object \
+  --bucket "${CHATTO_S3_BUCKET}" \
+  --key "${object_key}" \
+  --body "${archive_path}" \
   --region "${CHATTO_AWS_REGION}" \
   --expected-bucket-owner "${CHATTO_AWS_ACCOUNT_ID}" \
-  --sse AES256 \
+  --server-side-encryption AES256 \
   --checksum-algorithm SHA256 \
   --metadata "sha256=${backup_sha256}" \
-  --only-show-errors
+  --output json >/dev/null
 
 head_json=$("${AWS_BIN}" s3api head-object \
   --bucket "${CHATTO_S3_BUCKET}" \
