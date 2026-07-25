@@ -72,7 +72,7 @@ cleanup() {
     rm -f -- "${TAILSCALE_KEY_TEMP}"
   fi
   if [ -n "${INSTALL_TEMP_DIR}" ] &&
-    [[ "${INSTALL_TEMP_DIR}" == /tmp/chatto-host-install.* ]]; then
+    [[ "${INSTALL_TEMP_DIR}" == /var/tmp/chatto-host-install.* ]]; then
     rm -rf -- "${INSTALL_TEMP_DIR}"
   fi
 }
@@ -808,7 +808,9 @@ require_command systemctl
 require_command systemd-analyze
 require_command unzip
 
-INSTALL_TEMP_DIR=$(mktemp -d /tmp/chatto-host-install.XXXXXX)
+# /var/tmp, not /tmp: Debian 13 mounts /tmp as a tmpfs capped at half of RAM,
+# and the extracted AWS CLI alone exceeds that on the 512 MB bundle.
+INSTALL_TEMP_DIR=$(mktemp -d /var/tmp/chatto-host-install.XXXXXX)
 install_aws_cli
 install_chatto_binary
 install_tailscale
