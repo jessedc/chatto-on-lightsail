@@ -39,6 +39,7 @@ next step.
 - [7. Qualify recovery before production](#7-qualify-recovery-before-production)
 - [8. Move SSH onto the tailnet](#8-move-ssh-onto-the-tailnet)
 - [Reruns and recovery](#reruns-and-recovery)
+- [General admin tasks](#general-admin-tasks)
 
 ## Before installation
 
@@ -706,3 +707,52 @@ rollback.
 - A true recovery also needs the password-manager copies of
   `/etc/chatto/chatto.toml`, `/etc/chatto/chatto.env`,
   `/etc/chatto/smtp.env`, and the backup passphrase.
+
+## General admin tasks
+
+### Create a user
+
+**On the Lightsail host**, create the account with the operator CLI. Run it as
+the `chatto` service account so file ownership stays consistent, and pass the
+operator socket explicitly: the CLI defaults to `/tmp/chatto/operator.sock`,
+but this deployment serves the socket at `/run/chatto/operator.sock` (and the
+service's `PrivateTmp=true` hides its private `/tmp` anyway). Generate a
+password for the new account and store it in the password manager:
+
+```bash
+openssl rand -base64 24
+```
+
+The create command prompts for the password; paste the generated value at the
+prompt so it never lands in shell history:
+
+```bash
+(
+  cd /tmp
+  sudo -u chatto /usr/local/bin/chatto operator \
+    --config /etc/chatto/chatto.toml \
+    --operator-socket /run/chatto/operator.sock \
+    user create \
+    --login MEMBER_LOGIN \
+    --display-name "Member Name"
+)
+```
+
+Do not pass `--role owner` unless deliberately creating another owner-level
+account. Public registration stays disabled and `max_users = 10` caps the
+account count, so operator creation is the only path. Confirm the account
+exists:
+
+```bash
+(
+  cd /tmp
+  sudo -u chatto /usr/local/bin/chatto operator \
+    --config /etc/chatto/chatto.toml \
+    --operator-socket /run/chatto/operator.sock \
+    user list --search MEMBER_LOGIN
+)
+```
+
+If the create command fails with `dial unix ... no such file or directory`,
+the server is not running; check `systemctl status chatto`. The socket exists
+only while the service is up.
