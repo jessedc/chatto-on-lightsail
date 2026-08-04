@@ -756,3 +756,87 @@ exists:
 If the create command fails with `dial unix ... no such file or directory`,
 the server is not running; check `systemctl status chatto`. The socket exists
 only while the service is up.
+
+### Upgrade Chatto (unconfirmed)
+
+> **Status: unconfirmed.** The step list comes from the runbook's
+> "Security Updates and Manual Upgrades" section in `chatto-lightsail-plan.md`;
+> the concrete commands below mirror `install-host.sh`'s checksum-verified
+> install but have not been exercised end to end. Validate this procedure
+> during the next real upgrade, fix what differs, and remove this notice.
+
+Neither installer upgrades an existing different Chatto version, and the
+operator library refuses any `CHATTO_VERSION` other than the qualified
+release. Upgrading therefore has a repository half and a host half.
+
+**In this repository**, read the release notes for every release between the
+current pin and the target — pre-1.0 Chatto makes no compatibility promises —
+then move the pin to the new explicit target in all five places (never a
+latest-release lookup):
+
+- `chatto-operator-lib.sh` — the `CHATTO_VERSION must remain pinned`
+  enforcement check
+- `chatto-deploy.env` and `chatto-provisioned.env` — the recorded target
+- `chatto-deploy.env.example` and `tests/operator-workflow-test.sh` — keep
+  documentation and tests consistent
+
+**On the Lightsail host**, run the maintenance window. Stop the backup timer
+first: `chatto-backup.service` declares `Requires=chatto.service`, so a timer
+firing mid-upgrade would silently restart a deliberately stopped Chatto.
+
+```bash
+sudo systemctl stop chatto-backup.timer
+sudo systemctl start chatto-backup.service
+systemctl status chatto-backup.service
+```
+
+Require the backup to report a successful checksum-verified S3 upload before
+continuing. Then download and checksum-verify the exact target version
+(substitute `arm64` for `x86_64` if `uname -m` reports `aarch64`):
+
+```bash
+CHATTO_VERSION=v0.x.y
+cd "$(mktemp -d /var/tmp/chatto-upgrade.XXXXXX)"
+curl -fsSLO "https://github.com/chattocorp/chatto/releases/download/${CHATTO_VERSION}/chatto_Linux_x86_64.tar.gz"
+curl -fsSLO "https://github.com/chattocorp/chatto/releases/download/${CHATTO_VERSION}/chatto_${CHATTO_VERSION#v}_checksums.txt"
+grep "  chatto_Linux_x86_64.tar.gz\$" \
+  "chatto_${CHATTO_VERSION#v}_checksums.txt" | sha256sum --check -
+tar -xzf chatto_Linux_x86_64.tar.gz
+```
+
+Swap the binary, preserving the old one for rollback:
+
+```bash
+sudo systemctl stop chatto
+sudo cp -a /usr/local/bin/chatto /usr/local/bin/chatto.previous
+sudo install -o root -g root -m 0755 chatto /usr/local/bin/chatto
+sudo systemctl start chatto
+```
+
+Check readiness, login, logs, and memory:
+
+```bash
+/usr/local/bin/chatto version
+systemctl status chatto
+journalctl -u chatto -e
+```
+
+If startup or compatibility checks fail, roll back and investigate before
+retrying:
+
+```bash
+sudo systemctl stop chatto
+sudo install -o root -g root -m 0755 \
+  /usr/local/bin/chatto.previous /usr/local/bin/chatto
+sudo systemctl start chatto
+```
+
+Finally, restart the backup timer, confirm it is scheduled, and rerun the
+deployment verification (which asserts the installed binary matches the
+updated `CHATTO_VERSION` pin):
+
+```bash
+sudo systemctl start chatto-backup.timer
+systemctl list-timers chatto-backup.timer
+sudo ./verify-deployment.sh
+```
