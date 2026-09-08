@@ -179,15 +179,20 @@ grep -Fq \
   fail "pending SES run did not preserve the provisioned deployment record"
 
 sandbox_output="${TEST_TEMP_DIR}/sandbox-provisioned.env"
-if MOCK_ACCESS_KEY_EXISTS=1 \
+sandbox_log="${TEST_TEMP_DIR}/sandbox.log"
+MOCK_ACCESS_KEY_EXISTS=1 \
   MOCK_SMTP_ACCESS_KEY_EXISTS=1 \
   MOCK_SES_SANDBOX=1 \
   AWS_BIN="${REPOSITORY_DIR}/tests/mock-aws.sh" \
   "${REPOSITORY_DIR}/provision-aws.sh" \
   --env "${INPUT_ENV}" \
-  --output "${sandbox_output}" >/dev/null 2>&1; then
-  fail "SES sandbox account was accepted for production deployment"
-fi
+  --output "${sandbox_output}" \
+  >"${sandbox_log}" 2>&1 ||
+  fail "SES sandbox account was rejected instead of being accepted with a warning"
+grep -Fq \
+  'SES production sending is not enabled in us-west-2' \
+  "${sandbox_log}" ||
+  fail "SES sandbox run did not warn about sandbox delivery limits"
 [ -s "${sandbox_output}" ] ||
   fail "SES sandbox run did not preserve the provisioned deployment record"
 
