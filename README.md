@@ -840,3 +840,7 @@ sudo systemctl start chatto-backup.timer
 systemctl list-timers chatto-backup.timer
 sudo ./verify-deployment.sh
 ```
+
+## License
+
+Released under the [MIT License](LICENSE).
